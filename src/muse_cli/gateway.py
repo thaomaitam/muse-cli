@@ -262,6 +262,31 @@ def fetch_subscription(cookies, action_id=None, include_agreement=False):
     return res["subscription"], aid
 
 
+def fetch_invite(cookies):
+    """Invite-friends sheet data: GET https://muse.ai/api/hatch/invite.
+
+    Read-only. Keys include invite_state (ELIGIBLE / NOT_ELIGIBLE / ...),
+    code, invite_link, max_uses, use_count, uses_remaining, share_text,
+    reward{title, body} (earned stats as display text), subtitle,
+    has_redeemed_invite_code. `code` stays null until the user opens the
+    sheet once: the web app then POSTs the same URL to create the code. That
+    POST changes account state, so this client never sends it.
+    """
+    r = rq.get("https://muse.ai/api/hatch/invite", headers=_hatch_headers(cookies),
+               impersonate="chrome", timeout=20)
+    if r.status_code in (401, 403):
+        raise AuthError(f"api/hatch/invite -> {r.status_code} (cookies expired? re-export)")
+    if r.status_code != 200:
+        raise GatewayError(r.status_code, r.text[:200])
+    try:
+        d = r.json()
+    except ValueError:
+        raise GatewayError(-1, f"api/hatch/invite returned non-JSON ({r.text[:80]!r})")
+    if not isinstance(d, dict):
+        raise GatewayError(-1, f"api/hatch/invite returned {type(d).__name__}")
+    return d
+
+
 class Gateway:
     """One authenticated connection to the personal VM gateway."""
 

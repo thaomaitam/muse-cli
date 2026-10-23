@@ -88,6 +88,13 @@ chat / feed / goals / ideas / sessions / ...
   up again by scanning `/_next/static/chunks/*.js` for
   `createServerReference)("<id>",...,"fetchSubscriptionAction")`, then caches
   it as `subscription_action_id` in config.json.
+- **Invite friends** is a plain REST route on muse.ai (cookies only):
+  `GET /api/hatch/invite` returns `{invite_state, code, invite_link,
+  max_uses, use_count, uses_remaining, share_text, reward{title, body},
+  subtitle, has_redeemed_invite_code, redeem_invite_code_screen, ...}`. The
+  earned stats come only as display text in `reward`. `POST` to the same URL
+  creates the code (state-changing, the client never calls it); codes match
+  `^[A-Z0-9]{6,16}$`. Found via `useHatchInvitePageQuery` in the bundle.
 - `session.start`: `{method: "/api/session/start", params: {origin: "fresh",
   lifecycle: "persistent", title?}}`.
 - `session.rename`: flat `{session_id, title}`. pin/unpin/archive/unarchive/

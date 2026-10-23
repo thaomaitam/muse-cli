@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import __version__
-from .gateway import Gateway, AuthError, GatewayError, fetch_subscription, load_cookies
+from .gateway import Gateway, AuthError, GatewayError, fetch_invite, fetch_subscription, load_cookies
 from .update import cmd_update, finish_update_check, start_update_check
 
 CONFIG_DIR = os.path.expanduser("~/.config/muse-cli")
@@ -371,6 +371,54 @@ def cmd_usage(args):
         print("Additional tokens: none")
     if u["upgrade"] and not u["paid"]:
         print("Upgrade: https://muse.ai/settings")
+
+
+def summarize_invite(d):
+    """The invite fields that matter, from GET /api/hatch/invite."""
+    reward = d.get("reward") if isinstance(d.get("reward"), dict) else None
+    remaining = d.get("uses_remaining")
+    if remaining is None and d.get("max_uses") is not None and d.get("use_count") is not None:
+        remaining = max(d["max_uses"] - d["use_count"], 0)
+    return {
+        "state": d.get("invite_state"),
+        "code": d.get("code"),
+        "link": d.get("invite_link"),
+        "max_uses": d.get("max_uses"),
+        "used": d.get("use_count"),
+        "uses_remaining": remaining,
+        "reward": ({"title": reward.get("title"), "body": reward.get("body")} if reward else None),
+        "offer": d.get("subtitle"),
+        "share_text": d.get("share_text"),
+        "redeemed_someone_elses_code": d.get("has_redeemed_invite_code"),
+    }
+
+
+def cmd_invite(args):
+    cfg = load_config()
+    if not os.path.exists(cfg["cookies_file"]):
+        connect(cfg)  # raises the usual "run auth export" error
+    d = fetch_invite(load_cookies(cfg["cookies_file"]))
+    if args.raw:
+        out(d)
+        return
+    s = summarize_invite(d)
+    if args.json:
+        out(s)
+        return
+    if s["code"]:
+        print(f"Invite code: {s['code']}")
+        if s["link"]:
+            print(f"Link: {s['link']}")
+        if s["uses_remaining"] is not None:
+            extra = f" of {s['max_uses']}" if s["max_uses"] is not None else ""
+            print(f"Uses left: {s['uses_remaining']}{extra}")
+    else:
+        print(f"Invite code: none yet (state {s['state']}). Open Invite friends in the "
+              "muse.ai app once to create it; muse-cli only reads.")
+    if s["reward"]:
+        print(" ".join(x for x in (s["reward"]["title"], s["reward"]["body"]) if x))
+    if s["offer"]:
+        print(s["offer"])
 
 
 def cmd_threads(args):
@@ -915,6 +963,10 @@ def main():
     p.add_argument("--json", action="store_true", help="print the summary as JSON")
     p.add_argument("--raw", action="store_true", help="print the server's full subscription object")
     p.set_defaults(fn=cmd_usage)
+    p = sub.add_parser("invite", help="your invite code, uses left, rewards earned (read-only)")
+    p.add_argument("--json", action="store_true", help="print the summary as JSON")
+    p.add_argument("--raw", action="store_true", help="print the server's full invite object")
+    p.set_defaults(fn=cmd_invite)
     p = sub.add_parser("threads", help="list chats and side chats")
     p.add_argument("--all", dest="archived", action="store_true", help="include archived")
     p.set_defaults(fn=cmd_threads)

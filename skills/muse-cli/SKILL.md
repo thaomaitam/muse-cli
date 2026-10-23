@@ -141,6 +141,7 @@ muse-cli watch --timeout 60                             # tail live agent events
 muse-cli watch --thread <session-id>                    # tail one side chat
 muse-cli usage                                          # weekly limit % used, reset time, bonus tokens
 muse-cli usage --json
+muse-cli invite [--json]                                # invite code, uses left, rewards (read-only)
 muse-cli files --limit 20                               # images/videos the agent produced
 muse-cli download <seq|message-id|sandbox://...> -o DIR # save them locally
 muse-cli history --limit 3 --download DIR               # save files from these messages
@@ -176,6 +177,9 @@ only for methods with no wrapper.
   is matched as a genuine answer, not background chatter.
 - `send --wait 0` is fire-and-forget (no polling).
 - `history` without `--thread` reads the main chat only.
+- `invite` prints "none yet" until the code exists. The code is created
+  when the Invite friends sheet is opened in the app (a POST); muse-cli
+  never sends that POST or any redeem call.
 - `usage` goes to muse.ai with cookies only (no VM connection), so it still works
   while the VM sleeps. The first run after a web app deploy may take a few
   seconds while it re-finds the action id in the JS bundle.
