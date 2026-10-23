@@ -218,7 +218,7 @@ Pipe it into other tools:
 muse-cli send "what's on my calendar today?" | jq -r .reply.text
 ```
 
-Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer, 124 timeout; `send` exits 5 if delivery is not acked.
+Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer (incl. a plain-text question in the final reply), 124 timeout; always read `final_text`; `send` exits 5 if delivery is not acked.
 
 ## How it works
 

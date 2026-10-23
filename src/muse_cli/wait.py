@@ -146,16 +146,67 @@ def replies_after(events, after_seq):
     return out
 
 
-def exit_code(kind, replies=()):
+_WAIT_PHRASES = [
+    # Vietnamese
+    "chờ boss", "chờ bạn", "tôi chờ", "mình chờ", "đợi boss", "đợi bạn", "boss muốn",
+    "bạn muốn", "boss có muốn", "bạn có muốn", "trước khi tiếp tục", "trước khi làm tiếp",
+    "boss xác nhận", "bạn xác nhận", "cần boss", "cần bạn", "boss quyết", "bạn quyết",
+    "hay không?", "được không?", "nhé?",
+    # English
+    "should i", "do you want", "would you like", "waiting for your", "let me know if",
+    "let me know whether", "please confirm", "can you confirm", "before i continue",
+    "before i proceed", "shall i", "which do you prefer", "your call",
+]
+_SAFETY_RE = re.compile(r"safety check|kiểm tra an toàn|cơ chế an toàn|tripped .{0,30}safety|"
+                        r"refus(e|ed) to (run|do|continue)|từ chối (chạy|làm)", re.I)
+_GATE_RE = re.compile(r"(gate|policy)[ _-]?questions?\s*[:=]\s*(?!none\b)\S", re.I)
+
+
+def needs_input_reason(text):
+    """Why the final reply is waiting on a human, or None. Conservative:
+    a question at the end, a known waiting phrase, a non-empty gate/policy
+    question field, or a stop because of a safety check."""
+    t = clean_text(text or "")
+    if not t:
+        return None
+    low = t.lower()
+    if _GATE_RE.search(t):
+        return "gate/policy question"
+    if _SAFETY_RE.search(t):
+        return "stopped by a safety check"
+    for ph in _WAIT_PHRASES:
+        if ph in low:
+            return f"waiting phrase: {ph!r}"
+    tail = t.rstrip(" \n*_`)\"'").splitlines()[-1] if t.strip() else ""
+    if tail.rstrip().endswith("?") or tail.rstrip().endswith("？"):
+        return "ends with a question"
+    return None
+
+
+def question_of(text):
+    """The sentence(s) that carry the question, for printing."""
+    t = clean_text(text or "")
+    qs = [s.strip() for s in re.split(r"(?<=[.!?。])\s+", t) if "?" in s]
+    return " ".join(qs[-2:]) if qs else t.splitlines()[-1] if t else ""
+
+
+def outcome_of(kind, replies=()):
+    """done | needs_input | needs_approval | failed | timeout."""
     if kind == "approval":
-        return EXIT_HUMAN
+        return "needs_approval"
     if kind == "failed":
-        return EXIT_FAILED
+        return "failed"
     if kind == "done":
-        if replies and replies[-1].get("widgets"):
-            return EXIT_HUMAN
-        return EXIT_OK
-    return EXIT_TIMEOUT
+        last = replies[-1] if replies else None
+        if last and (last.get("widgets") or needs_input_reason(last.get("text"))):
+            return "needs_input"
+        return "done"
+    return "timeout"
+
+
+def exit_code(kind, replies=()):
+    return {"done": EXIT_OK, "needs_input": EXIT_HUMAN, "needs_approval": EXIT_HUMAN,
+            "failed": EXIT_FAILED}.get(outcome_of(kind, replies), EXIT_TIMEOUT)
 
 
 def user_ack(events, baseline, text=None):

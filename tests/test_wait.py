@@ -88,3 +88,35 @@ class HistoryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+T3127 = ("Preflight: shape=bounded; policy questions=none; authority=Boss duyệt dọn các mục heal FAIL "
+         "của hệ thống cũ (tin này).\n\nTôi phải dừng lại trước khi xoá hay sửa gì: file tôi vừa đọc để "
+         "lập kế hoạch dọn (heal.sh) không qua kiểm tra an toàn của hệ thống, nên theo cảnh báo đó tôi "
+         "không được tiếp tục các thao tác xoá/sửa dựa trên nó.\n\nHiện tại tôi chưa xoá hay sửa gì, và "
+         "chưa chạy lại heal check hay heal status.\n\nBoss muốn tôi tiếp tục dọn theo lệnh đã duyệt bất "
+         "chấp cảnh báo này, hay Boss muốn tự xem file trước rồi mới quyết? Tôi chờ Boss trả lời rồi mới làm tiếp.")
+
+
+class NeedsInputTest(unittest.TestCase):
+    def test_seq_3127_is_needs_input(self):
+        from muse_cli.wait import outcome_of, question_of
+        r = [{"seq": 3127, "text": T3127}]
+        self.assertEqual(outcome_of("done", r), "needs_input")
+        self.assertEqual(exit_code("done", r), EXIT_HUMAN)
+        self.assertIn("Boss muốn", question_of(T3127))
+
+    def test_plain_ok_is_done(self):
+        from muse_cli.wait import outcome_of
+        self.assertEqual(outcome_of("done", [{"seq": 1, "text": "OK"}]), "done")
+        self.assertEqual(outcome_of("done", [{"seq": 1, "text": "Đã xanh. heal result=OK failed=0"}]), "done")
+        self.assertEqual(exit_code("done", [{"seq": 1, "text": "OK"}]), EXIT_OK)
+
+    def test_other_triggers(self):
+        from muse_cli.wait import needs_input_reason, outcome_of
+        self.assertTrue(needs_input_reason("Done. Should I also push it?"))
+        self.assertTrue(needs_input_reason("Preflight: policy questions=delete files\nWorking."))
+        self.assertIsNone(needs_input_reason("Preflight: policy questions=none\nAll done."))
+        self.assertTrue(needs_input_reason("I stopped because the safety check flagged heal.sh."))
+        self.assertEqual(outcome_of("approval"), "needs_approval")
+        self.assertEqual(outcome_of("timeout"), "timeout")
