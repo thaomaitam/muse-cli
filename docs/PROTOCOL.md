@@ -140,3 +140,22 @@ otherwise). Responses are `{"ok":true,"result":{...}}` except `fs.list`.
 `fs.read` of some home files (IDENTITY.md ...) returns a longer body than
 `fs.list`'s size: the server prepends an "About this file" note. muse-cli
 reads in 4 MiB windows until `eof` and writes in 4 MiB append chunks.
+
+## Turn completion and approvals
+
+Live `chat.subscribe` replays current state on connect, then streams:
+
+- `task.status` payload `{status, agent_id, root_agent_id, task_id, session_id,
+  is_thread, active_subagent_count}`; seen values `running`, `completed`.
+  Only the root agent's status (agent_id == root_agent_id) ends a turn.
+- `approvals.snapshot` payload `{emitted_at_ms, pending_approvals[], recent_approvals[]}`;
+  each approval has `approval_id`, `display.{summary_title, short_explanation,
+  permission_question{kind,scope,text}, detail_rows}`, `payload.network_payload`,
+  `request_expires_at_ms`, and once decided `decision`.
+- Widgets: assistant messages embed `[[hatch_widget:<id>]]` in text and carry
+  `payload.widgets[{widget_id, kind:"option", data.options, display_text, state}]`.
+
+Routes: `egress.approvals` GET /approvals (`pending`, `pending_approvals`,
+`recent`); `egress.approval.decide` POST /approvals/{id}/decide `{decision}` with
+decision in `allow_once|allow_session|allow_today|allow_always|deny|deny_always`
+(server also lists `timed_out`, `auto_allow`).

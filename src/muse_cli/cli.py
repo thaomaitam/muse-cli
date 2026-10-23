@@ -711,55 +711,174 @@ def cmd_send(args):
         except (GatewayError, TimeoutError):
             pass
         stream_sid = gw._open("chat.stream", body=params)
-        if not args.wait:
-            out({"sent": True, "stream": stream_sid,
-                 "note": "fire-and-forget; check `muse-cli history` for the reply"})
-            return
-
-        # The reply is picked up by polling history, not by watching the
-        # live stream: threaded replies never arrive as live events, live
-        # chat events use delta.* shapes (not message.*), and only the
-        # history shape carries the reply_to discriminator that tells
-        # genuine replies apart from proactive pushes. Sequential unary
-        # calls also mean a single frame consumer: no Noise races, ever.
-        reply, deadline = None, time.time() + args.wait
-        while time.time() < deadline and reply is None:
+        # Wait for delivery: our message.user must show up in history with a
+        # seq. Closing the connection before that can drop the message.
+        from .wait import user_ack
+        user_seq, ack_deadline = None, time.time() + args.ack_timeout
+        while user_seq is None and time.time() < ack_deadline:
             try:
                 h = gw.call_json("chat.history", body={"limit": 10, **scope})
+                user_seq = user_ack(h.get("chat_events", []), baseline, args.text)
             except (GatewayError, TimeoutError):
+                pass
+            if user_seq is None:
                 time.sleep(POLL)
-                continue
-            evs = sorted(h.get("chat_events", []), key=lambda e: e.get("seq", 0))
-            for ev in evs:
-                if is_reply(ev, baseline):
-                    reply = fmt_event(ev)
-                    break
-            if reply is None:
-                time.sleep(POLL)
-        result = {"sent": True, "stream": stream_sid}
-        if reply and args.download:
-            # Media often lands as separate presentation events after the
-            # text reply; give them a moment, then save every file newer
-            # than the baseline.
-            time.sleep(min(3, max(0, deadline - time.time())))
-            try:
-                h = gw.call_json("chat.history", body={"limit": 20, **scope})
-                res = []
-                for ev in h.get("chat_events", []):
-                    if (ev.get("seq") or 0) > baseline:
-                        for r in event_resources(ev):
-                            if r["path"] not in [x["path"] for x in res]:
-                                res.append(r)
-                result["downloads"] = save_resources(gw, res, args.download)
-            except (GatewayError, TimeoutError) as e:
-                result["download_error"] = str(e)
-        if reply:
-            result["reply"] = reply
-        else:
-            result["note"] = f"no assistant reply within {args.wait}s; check `muse-cli history`"
-        out(result)
+    except BaseException:
+        gw.close()
+        raise
+    # The sending connection stays open until we are done waiting, so the
+    # chat.stream request is never torn down mid-turn.
+    try:
+        _send_finish(args, cfg, scope, user_seq, stream_sid)
     finally:
         gw.close()
+
+
+def _send_finish(args, cfg, scope, user_seq, stream_sid):
+    result = {"sent": True, "delivered": user_seq is not None, "user_seq": user_seq,
+              "stream": stream_sid}
+    if user_seq is None:
+        result["note"] = f"no delivery ack within {args.ack_timeout}s; check `muse-cli history`"
+        out(result)
+        sys.exit(5)
+    wait_s = 24 * 3600 if args.until_done else args.wait
+    if not wait_s:
+        out(result)
+        return
+    code, res = run_wait(cfg, args.thread, user_seq, wait_s, require_running=True)
+    result.update(outcome=res["outcome"], status=res["status"], replies=res["replies"])
+    for k in ("approvals", "widgets"):
+        if k in res:
+            result[k] = res[k]
+    if res["replies"]:
+        r = res["replies"][-1]
+        result["reply"] = {"seq": r["seq"], "role": "message.assistant",
+                           "message_id": r["message_id"], "text": r["text"]}
+    if args.download and res["replies"]:
+        gw = connect(cfg)
+        try:
+            h = gw.call_json("chat.history", body={"limit": 30, **scope})
+            found = []
+            for ev in h.get("chat_events", []):
+                if (ev.get("seq") or 0) > user_seq:
+                    for r in event_resources(ev):
+                        if r["path"] not in [x["path"] for x in found]:
+                            found.append(r)
+            result["downloads"] = save_resources(gw, found, args.download)
+        except (GatewayError, TimeoutError) as e:
+            result["download_error"] = str(e)
+        finally:
+            gw.close()
+    if res["outcome"] == "timeout":
+        result["note"] = f"turn not finished within {wait_s}s; run `muse-cli wait --after-seq {user_seq}`"
+    out(result)
+    sys.exit(code)
+
+
+def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
+             on_event=None):
+    """Subscribe until the turn ends, a human is needed, or timeout.
+
+    Returns (exit_code, result). The final replies are re-read from
+    chat.history on a fresh connection (the subscription's reader thread
+    still owns the old one).
+    """
+    from .wait import Waiter, replies_after, exit_code
+    scope = {"session_id": thread} if thread else {}
+    gw = connect(cfg)
+    try:
+        if after_seq is None:
+            h = gw.call_json("chat.history", body={"limit": 1, **scope})
+            evs = h.get("chat_events", [])
+            after_seq = max((e.get("seq") or 0 for e in evs), default=0)
+            # A plain `wait` after the last message: anything newer counts.
+        w = Waiter(thread=thread, require_running=require_running)
+        body = {"capabilities": ["chat_cancel", "delta_stream"], **scope}
+
+        def on_record(line):
+            if on_event:
+                on_event(line)
+            return w.feed(line) is not None
+        gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9,
+                         idle_timeout=timeout, overall_timeout=timeout, on_record=on_record)
+    finally:
+        gw.close()
+    kind, detail = w.result or ("timeout", w.status)
+    replies = []
+    gw = connect(cfg)
+    try:
+        h = gw.call_json("chat.history", body={"limit": 30, **scope})
+        replies = replies_after(h.get("chat_events", []), after_seq)
+    except (GatewayError, TimeoutError):
+        pass
+    finally:
+        gw.close()
+    res = {"outcome": kind, "status": w.status, "after_seq": after_seq, "replies": replies}
+    if kind == "approval":
+        res["approvals"] = detail
+    if replies and replies[-1].get("widgets"):
+        res["widgets"] = replies[-1]["widgets"]
+        if kind == "done":
+            res["outcome"] = "needs_input"
+    return exit_code(kind, replies), res
+
+
+def _print_wait(res, as_json):
+    if as_json:
+        return out(res)
+    for r in res["replies"]:
+        print(f"[{r['seq']}] {r['text']}")
+        for wd in r.get("widgets") or []:
+            opts = " / ".join(map(str, wd.get("options") or []))
+            print(f"  ? widget {wd['widget_id']}: {wd.get('text') or ''}" + (f" [{opts}]" if opts else ""))
+    for a in res.get("approvals") or []:
+        print(f"NEEDS APPROVAL {a['approval_id']}: {a.get('title')} - {a.get('question')}")
+        if a.get("why"):
+            print(f"  why: {a['why']}")
+    print(f"-- {res['outcome']} (status={res['status']})", file=sys.stderr)
+
+
+def cmd_wait(args):
+    code, res = run_wait(load_config(), args.thread, args.after_seq, args.timeout,
+                         require_running=args.require_running)
+    _print_wait(res, args.json)
+    sys.exit(code)
+
+
+def cmd_approvals(args):
+    from .wait import describe_approval
+    gw = connect(load_config())
+    try:
+        r = gw.call_json("egress.approvals")
+        pend = r.get("pending_approvals") or r.get("pending") or []
+        if args.raw:
+            return out(r)
+        o = {"pending": [describe_approval(a) for a in pend]}
+        if args.recent:
+            o["recent"] = [{**describe_approval(a), "decision": a.get("decision")}
+                           for a in (r.get("recent_approvals") or r.get("recent") or [])]
+        out(o)
+    finally:
+        gw.close()
+
+
+def cmd_decide(decision_of):
+    def run(args):
+        decision = decision_of(args)
+        gw = connect(load_config())
+        try:
+            out(gw.call_json("egress.approval.decide", path_params={"approval_id": args.id},
+                             body={"decision": decision}))
+        finally:
+            gw.close()
+    return run
+
+
+def _approve_decision(args):
+    for k in ("once", "session", "today", "always"):
+        if getattr(args, k):
+            return "allow_" + k
+    return "allow_once"
 
 
 def _print_watch_row(line, show_all):
@@ -1152,10 +1271,30 @@ def main():
     p.set_defaults(fn=cmd_history)
     p = sub.add_parser("send", help="send the agent a message")
     p.add_argument("text"); p.add_argument("--thread", default=None)
-    p.add_argument("--wait", type=int, default=90, help="seconds to wait for reply (0 = don't)")
+    p.add_argument("--wait", type=int, default=90,
+                   help="max seconds to wait for the turn to finish (0 = only wait for delivery)")
+    p.add_argument("--until-done", action="store_true", help="wait with no practical time limit")
+    p.add_argument("--ack-timeout", type=int, default=30, help="seconds to wait for the delivery ack")
     p.add_argument("--download", metavar="DIR", default=None,
                    help="save files the reply produced into DIR (needs --wait)")
     p.set_defaults(fn=cmd_send)
+    p = sub.add_parser("wait", help="block until the agent's turn ends (0 ok, 2 failed, 4 needs human, 124 timeout)")
+    p.add_argument("--thread", default=None); p.add_argument("--after-seq", type=int, default=None)
+    p.add_argument("--timeout", type=int, default=600); p.add_argument("--json", action="store_true")
+    p.add_argument("--require-running", action="store_true",
+                   help="ignore an already-finished status until a new run starts")
+    p.set_defaults(fn=cmd_wait)
+    p = sub.add_parser("approvals", help="list pending approvals (network access etc.)")
+    p.add_argument("--recent", action="store_true"); p.add_argument("--raw", action="store_true")
+    p.set_defaults(fn=cmd_approvals)
+    p = sub.add_parser("approve", help="approve a pending request"); p.add_argument("id")
+    g = p.add_mutually_exclusive_group()
+    for k in ("once", "session", "today", "always"):
+        g.add_argument(f"--{k}", action="store_true", help=f"allow_{k}")
+    p.set_defaults(fn=cmd_decide(_approve_decision))
+    p = sub.add_parser("deny", help="deny a pending request"); p.add_argument("id")
+    p.add_argument("--always", action="store_true", help="deny_always")
+    p.set_defaults(fn=cmd_decide(lambda a: "deny_always" if a.always else "deny"))
     p = sub.add_parser("files", help="list files (images/videos) in recent messages")
     p.add_argument("--thread", default=None); p.add_argument("--limit", type=int, default=20)
     p.set_defaults(fn=cmd_files)

@@ -164,6 +164,23 @@ muse-cli wake
 muse-cli redeem <CODE>                # redeem a friend's invite code: one-time, ask first
 ```
 
+## Driving Muse from an agent: never poll
+
+- Never poll with `sleep` + `history` loops.
+- Send with `muse-cli send "..." --until-done` (blocks until the turn ends), or
+  `muse-cli send "..." --wait 0` (returns once delivered, prints `user_seq`) and
+  then run `muse-cli wait --after-seq <user_seq> --timeout 1800` as a
+  background command and act when it exits.
+- `send` always waits for the delivery ack (our message appears in history
+  with a seq) before exiting; it exits 5 if no ack arrives. Never close the
+  connection before that (no raw fire-and-forget).
+- Exit codes of `wait` and `send --wait/--until-done`:
+  `0` turn done (final replies printed) · `2` task failed/cancelled ·
+  `4` needs a human: a pending approval (`muse-cli approvals`, then
+  `muse-cli approve ID --once|--session|--today|--always` or `muse-cli deny ID`;
+  ask the user first) or an unanswered widget question (printed with its
+  options) · `124` timeout (run `wait` again).
+
 ## System Files (fs)
 
 Paths are relative to the System Files root (the agent home: AGENTS.md,

@@ -470,7 +470,8 @@ class Gateway:
         """Open a subscription; returns list of raw record bytes.
 
         ``on_record`` is called with each record the moment it arrives, for
-        callers that show events live instead of after the stream ends.
+        callers that show events live instead of after the stream ends. If it
+        returns a truthy value the subscription stops right there.
         """
         sid = self._open(method, path_params, body, query)
         buf, records = b"", []
@@ -487,8 +488,9 @@ class Gateway:
         threading.Thread(target=reader, daemon=True).start()
         deadline = time.time() + overall_timeout
         idle = time.time() + idle_timeout
+        halted = False
         try:
-            while time.time() < deadline and len(records) < max_records:
+            while not halted and time.time() < deadline and len(records) < max_records:
                 try:
                     sf = q.get(timeout=2)
                 except queue_mod.Empty:
@@ -516,14 +518,15 @@ class Gateway:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
                         records.append(line)
-                        if on_record:
-                            on_record(line)
+                        if on_record and on_record(line):
+                            halted = True
+                            break
                         if len(records) >= max_records:
                             break
         finally:
             nonlocal_stop = True
             stop = nonlocal_stop
-        if buf.strip():
+        if buf.strip() and not halted:
             records.append(buf)
             if on_record:
                 on_record(buf)
