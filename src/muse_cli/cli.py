@@ -746,8 +746,9 @@ def _send_finish(args, cfg, scope, user_seq, stream_sid):
         out(result)
         return
     code, res = run_wait(cfg, args.thread, user_seq, wait_s, require_running=True)
-    result.update(outcome=res["outcome"], status=res["status"], replies=res["replies"])
-    for k in ("approvals", "widgets"):
+    result.update(outcome=res["outcome"], status=res["status"], final_text=res["final_text"],
+                  replies=res["replies"])
+    for k in ("approvals", "widgets", "question", "needs_input_reason"):
         if k in res:
             result[k] = res[k]
     if res["replies"]:
@@ -771,7 +772,11 @@ def _send_finish(args, cfg, scope, user_seq, stream_sid):
             gw.close()
     if res["outcome"] == "timeout":
         result["note"] = f"turn not finished within {wait_s}s; run `muse-cli wait --after-seq {user_seq}`"
-    out(result)
+    if args.text:
+        print(f"user_seq={user_seq}")
+        _print_wait(res, False)
+    else:
+        out(result)
     sys.exit(code)
 
 
@@ -783,7 +788,7 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     chat.history on a fresh connection (the subscription's reader thread
     still owns the old one).
     """
-    from .wait import Waiter, replies_after, exit_code
+    from .wait import Waiter, replies_after, exit_code, outcome_of, needs_input_reason, question_of
     scope = {"session_id": thread} if thread else {}
     gw = connect(cfg)
     try:
@@ -813,13 +818,16 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
         pass
     finally:
         gw.close()
-    res = {"outcome": kind, "status": w.status, "after_seq": after_seq, "replies": replies}
+    res = {"outcome": outcome_of(kind, replies), "status": w.status, "after_seq": after_seq,
+           "final_text": replies[-1]["text"] if replies else None, "replies": replies}
     if kind == "approval":
         res["approvals"] = detail
     if replies and replies[-1].get("widgets"):
         res["widgets"] = replies[-1]["widgets"]
-        if kind == "done":
-            res["outcome"] = "needs_input"
+    if res["outcome"] == "needs_input":
+        last = replies[-1]
+        res["needs_input_reason"] = "widget" if last.get("widgets") else needs_input_reason(last["text"])
+        res["question"] = question_of(last["text"])
     return exit_code(kind, replies), res
 
 
@@ -831,6 +839,8 @@ def _print_wait(res, as_json):
         for wd in r.get("widgets") or []:
             opts = " / ".join(map(str, wd.get("options") or []))
             print(f"  ? widget {wd['widget_id']}: {wd.get('text') or ''}" + (f" [{opts}]" if opts else ""))
+    if res.get("question"):
+        print(f"NEEDS INPUT ({res.get('needs_input_reason')}): {res['question']}")
     for a in res.get("approvals") or []:
         print(f"NEEDS APPROVAL {a['approval_id']}: {a.get('title')} - {a.get('question')}")
         if a.get("why"):
@@ -1274,6 +1284,7 @@ def main():
     p.add_argument("--wait", type=int, default=90,
                    help="max seconds to wait for the turn to finish (0 = only wait for delivery)")
     p.add_argument("--until-done", action="store_true", help="wait with no practical time limit")
+    p.add_argument("--text", action="store_true", help="print the final reply as plain text instead of JSON")
     p.add_argument("--ack-timeout", type=int, default=30, help="seconds to wait for the delivery ack")
     p.add_argument("--download", metavar="DIR", default=None,
                    help="save files the reply produced into DIR (needs --wait)")

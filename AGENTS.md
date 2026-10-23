@@ -24,8 +24,14 @@
   `0` turn done (final replies printed) · `2` task failed/cancelled ·
   `4` needs a human: a pending approval (`muse-cli approvals`, then
   `muse-cli approve ID --once|--session|--today|--always` or `muse-cli deny ID`;
-  ask the user first) or an unanswered widget question (printed with its
-  options) · `124` timeout (run `wait` again).
+  ask the user first) or a question in the final reply (widget or plain text,
+  printed) · `124` timeout (run `wait` again).
+- After every `wait`/`send` read the final reply text (`final_text` in JSON,
+  or the printed reply), not just the exit code. Outcomes: `done`,
+  `needs_input` (Muse asked you something in plain text, a widget, a
+  non-empty gate/policy question, or stopped on a safety check; `question`
+  holds it), `needs_approval`, `failed`, `timeout`. `send --text` prints the
+  reply as plain text instead of JSON.
 
 ## Cutting a release
 
