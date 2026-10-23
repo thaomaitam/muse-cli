@@ -25,5 +25,12 @@ class InviteTest(unittest.TestCase):
         self.assertIsNone(s["reward"])
 
 
+class RedeemValidationTest(unittest.TestCase):
+    def test_rejects_bad_code_without_network(self):
+        from muse_cli.gateway import redeem_invite_code
+        with self.assertRaises(ValueError):
+            redeem_invite_code("", "bad code!")
+
+
 if __name__ == "__main__":
     unittest.main()

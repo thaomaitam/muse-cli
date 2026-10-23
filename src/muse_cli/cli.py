@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import __version__
-from .gateway import Gateway, AuthError, GatewayError, fetch_invite, fetch_subscription, load_cookies
+from .gateway import Gateway, AuthError, GatewayError, fetch_invite, fetch_subscription, redeem_invite_code, load_cookies
 from .update import cmd_update, finish_update_check, start_update_check
 
 CONFIG_DIR = os.path.expanduser("~/.config/muse-cli")
@@ -419,6 +419,25 @@ def cmd_invite(args):
         print(" ".join(x for x in (s["reward"]["title"], s["reward"]["body"]) if x))
     if s["offer"]:
         print(s["offer"])
+
+
+def cmd_redeem(args):
+    cfg = load_config()
+    if not os.path.exists(cfg["cookies_file"]):
+        connect(cfg)
+    try:
+        status, body = redeem_invite_code(load_cookies(cfg["cookies_file"]), args.code)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+    if args.json:
+        out({"status": status, **body})
+    elif body.get("success"):
+        print(f"Redeemed: {body.get('redemptionStatus') or 'ok'}")
+    else:
+        print(f"Not redeemed ({body.get('reason')}): {body.get('detail') or ''}".rstrip(": "))
+    if not body.get("success"):
+        sys.exit(1)
 
 
 def cmd_threads(args):
@@ -967,6 +986,9 @@ def main():
     p.add_argument("--json", action="store_true", help="print the summary as JSON")
     p.add_argument("--raw", action="store_true", help="print the server's full invite object")
     p.set_defaults(fn=cmd_invite)
+    p = sub.add_parser("redeem", help="redeem a friend's invite code (within 48h of joining)")
+    p.add_argument("code"); p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_redeem)
     p = sub.add_parser("threads", help="list chats and side chats")
     p.add_argument("--all", dest="archived", action="store_true", help="include archived")
     p.set_defaults(fn=cmd_threads)

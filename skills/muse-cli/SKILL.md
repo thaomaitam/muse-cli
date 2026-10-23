@@ -161,6 +161,7 @@ muse-cli idea-exec <idea-id>          # the agent acts on the idea (real work)
 muse-cli session-start --title "x"    # new side chat
 muse-cli session-rename <id> "title"  # also: pin, unpin, archive, unarchive, delete
 muse-cli wake
+muse-cli redeem <CODE>                # redeem a friend's invite code: one-time, ask first
 ```
 
 ## Escape hatch

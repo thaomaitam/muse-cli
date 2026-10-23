@@ -95,6 +95,11 @@ chat / feed / goals / ideas / sessions / ...
   earned stats come only as display text in `reward`. `POST` to the same URL
   creates the code (state-changing, the client never calls it); codes match
   `^[A-Z0-9]{6,16}$`. Found via `useHatchInvitePageQuery` in the bundle.
+- **Redeem a code:** `POST /api/hatch/invite-code/redeem` `{code,
+  supportsRedemptionStatus: true}`. Success: `{success: true,
+  redemptionStatus: "redeemed"}`. Failure (400): `{success: false, reason,
+  detail}`, e.g. `window_expired` ("Your 48-hour window to redeem a code has
+  passed."), `already_redeemed`, `invalid`.
 - `session.start`: `{method: "/api/session/start", params: {origin: "fresh",
   lifecycle: "persistent", title?}}`.
 - `session.rename`: flat `{session_id, title}`. pin/unpin/archive/unarchive/

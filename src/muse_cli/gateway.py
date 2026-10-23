@@ -287,6 +287,30 @@ def fetch_invite(cookies):
     return d
 
 
+def redeem_invite_code(cookies, code):
+    """Redeem a friend's invite code (WRITES account state; one-shot).
+
+    POST https://muse.ai/api/hatch/invite-code/redeem {code,
+    supportsRedemptionStatus: true}. Returns (http_status, body) where body
+    is {"success": true, "redemptionStatus": "redeemed"|...} or {"success":
+    false, "reason": "window_expired"|"invalid"|"already_redeemed"|...,
+    "detail": "..."}. Only valid within 48 h of the account joining.
+    """
+    code = code.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{6,16}", code):
+        raise ValueError(f"not an invite code: {code!r}")
+    r = rq.post("https://muse.ai/api/hatch/invite-code/redeem", headers=_hatch_headers(cookies),
+                data=json.dumps({"code": code, "supportsRedemptionStatus": True}),
+                impersonate="chrome", timeout=30)
+    if r.status_code in (401, 403):
+        raise AuthError(f"invite-code/redeem -> {r.status_code} (cookies expired? re-export)")
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"success": False, "reason": "unknown", "detail": r.text[:200]}
+    return r.status_code, body
+
+
 class Gateway:
     """One authenticated connection to the personal VM gateway."""
 
