@@ -83,7 +83,10 @@ chat / feed / goals / ideas / sessions / ...
   {state, percentUsed, resetsAt (unix s), quotaStatus}, statusSubtitle,
   usageRowLabel, topupBalance, topupTotal, topupRowLabel,
   entryPointCtaLabel, ...}}`. The bonus token % is the web app's own
-  `round(100*(total-clamp(balance))/total)`. The action id is a build hash
+  `round(100*(total-clamp(balance))/total)`. `topupBalance`/`topupTotal` are NOT
+  tokens (120M units showed as "3B tokens left"); the web app never converts
+  them and prints `topupRowValueLabel` verbatim, so the CLI parses tokens
+  left from that label. The action id is a build hash
   (`4029ac5c...` as of 2026-10-23); when it stops working the client looks it
   up again by scanning `/_next/static/chunks/*.js` for
   `createServerReference)("<id>",...,"fetchSubscriptionAction")`, then caches

@@ -302,21 +302,54 @@ def cmd_status(_args):
         gw.close()
 
 
+_SCALE = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12,
+          "nghìn": 10**3, "triệu": 10**6, "tỷ": 10**9}
+_TOKENS_LEFT_RE = re.compile(
+    r"(?:còn\s*)?([\d][\d.,]*)\s*(K|M|B|T|nghìn|triệu|tỷ)?\s*tokens?(?:\s*left)?", re.I)
+
+
+def parse_tokens_left(label):
+    """'0% used (3B tokens left)' / 'Đã dùng 4% (còn 12 tỷ token)' -> 3e9 / 12e9."""
+    if not label:
+        return None
+    m = _TOKENS_LEFT_RE.search(label)
+    if not m:
+        return None
+    num = m.group(1)
+    num = num.replace(",", "") if "." in num or num.count(",") != 1 else num.replace(",", ".")
+    unit = m.group(2) or ""
+    scale = _SCALE.get(unit.upper() if len(unit) == 1 else unit.lower(), 1)
+    try:
+        return int(round(float(num) * scale))
+    except ValueError:
+        return None
+
+
 def summarize_usage(sub):
-    """Flatten fetchSubscriptionAction's result into the numbers that matter."""
+    """Flatten fetchSubscriptionAction's result into the numbers that matter.
+
+    topupBalance/topupTotal are NOT tokens (a server-side unit; 120M of them
+    showed as "3B tokens left"). The web app uses them only for the bar
+    percent and prints the server's topupRowValueLabel verbatim, so do the
+    same: percent from the ratio, token count parsed from the label.
+    """
     tier = sub.get("tier") or {}
     usage = sub.get("usage") or {}
     resets = usage.get("resetsAt")
     total, balance = sub.get("topupTotal") or 0, sub.get("topupBalance") or 0
+    value_label = sub.get("topupRowValueLabel")
     bonus = None
-    if total > 0:
+    if total > 0 and value_label is not None and value_label.strip():
         used = total - min(max(balance, 0), total)
         bonus = {"label": sub.get("topupRowLabel") or "Additional tokens",
+                 "value_label": value_label,
                  "used_percent": round(100 * used / total),
-                 "remaining_tokens": balance, "total_tokens": total}
+                 "remaining_tokens": parse_tokens_left(value_label),
+                 "balance_units": balance, "total_units": total}
     return {
         "plan": tier.get("name"), "tier": tier.get("tierCode"), "paid": tier.get("isPaid"),
         "label": sub.get("usageRowLabel"),
+        "value_label": sub.get("usageRowValueLabel"),
         "state": usage.get("state"),
         "used_percent": usage.get("percentUsed"),
         "quota_status": usage.get("quotaStatus"),
@@ -353,7 +386,9 @@ def cmd_usage(args):
         out(u)
         return
     head = u["label"] or u["plan"] or "Plan"
-    if u["used_percent"] is not None:
+    if u["value_label"]:
+        line = f"{head}: {u['value_label']}"
+    elif u["used_percent"] is not None:
         line = f"{head}: {u['used_percent']}% used"
     else:
         line = f"{head}: {u['state'] or 'unknown'}"
@@ -364,9 +399,7 @@ def cmd_usage(args):
         print(f"  quota: {u['quota_status']}")
     b = u["bonus_tokens"]
     if b:
-        print(f"{b['label']}: {b['used_percent']}% used, "
-              f"{_human_tokens(b['remaining_tokens'])} of {_human_tokens(b['total_tokens'])}"
-              " tokens left (never expire)")
+        print(f"{b['label']}: {b['value_label']} (never expire)")
     else:
         print("Additional tokens: none")
     if u["upgrade"] and not u["paid"]:
