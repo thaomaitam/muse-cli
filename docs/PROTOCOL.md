@@ -83,11 +83,28 @@ chat / feed / goals / ideas / sessions / ...
   {state, percentUsed, resetsAt (unix s), quotaStatus}, statusSubtitle,
   usageRowLabel, topupBalance, topupTotal, topupRowLabel,
   entryPointCtaLabel, ...}}`. The bonus token % is the web app's own
-  `round(100*(total-clamp(balance))/total)`. The action id is a build hash
+  `round(100*(total-clamp(balance))/total)`. `topupBalance`/`topupTotal` are NOT
+  tokens (120M units showed as "3B tokens left"); the web app never converts
+  them and prints `topupRowValueLabel` verbatim, so the CLI parses tokens
+  left from that label. The action id is a build hash
   (`4029ac5c...` as of 2026-10-23); when it stops working the client looks it
   up again by scanning `/_next/static/chunks/*.js` for
   `createServerReference)("<id>",...,"fetchSubscriptionAction")`, then caches
   it as `subscription_action_id` in config.json.
+- **Invite friends** is a plain REST route on muse.ai (cookies only):
+  `GET /api/hatch/invite` returns `{invite_state, code, invite_link,
+  max_uses, use_count, uses_remaining, share_text, reward{title, body},
+  subtitle, has_redeemed_invite_code, redeem_invite_code_screen, ...}`. The
+  earned stats come only as display text in `reward`. `POST` (no body) to the same URL
+  creates the code and returns `{code, max_uses (30), use_count, invite_link
+  (https://muse.ai/join), share_text}`; `invite --create` sends it only when
+  GET shows `code: null`; codes match
+  `^[A-Z0-9]{6,16}$`. Found via `useHatchInvitePageQuery` in the bundle.
+- **Redeem a code:** `POST /api/hatch/invite-code/redeem` `{code,
+  supportsRedemptionStatus: true}`. Success: `{success: true,
+  redemptionStatus: "redeemed"}`. Failure (400): `{success: false, reason,
+  detail}`, e.g. `window_expired` ("Your 48-hour window to redeem a code has
+  passed."), `already_redeemed`, `invalid`.
 - `session.start`: `{method: "/api/session/start", params: {origin: "fresh",
   lifecycle: "persistent", title?}}`.
 - `session.rename`: flat `{session_id, title}`. pin/unpin/archive/unarchive/

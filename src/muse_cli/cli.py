@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import __version__
-from .gateway import Gateway, AuthError, GatewayError, fetch_subscription, load_cookies
+from .gateway import Gateway, AuthError, GatewayError, create_invite, fetch_invite, fetch_subscription, redeem_invite_code, load_cookies
 from .update import cmd_update, finish_update_check, start_update_check
 
 CONFIG_DIR = os.path.expanduser("~/.config/muse-cli")
@@ -302,21 +302,54 @@ def cmd_status(_args):
         gw.close()
 
 
+_SCALE = {"": 1, "K": 10**3, "M": 10**6, "B": 10**9, "T": 10**12,
+          "nghìn": 10**3, "triệu": 10**6, "tỷ": 10**9}
+_TOKENS_LEFT_RE = re.compile(
+    r"(?:còn\s*)?([\d][\d.,]*)\s*(K|M|B|T|nghìn|triệu|tỷ)?\s*tokens?(?:\s*left)?", re.I)
+
+
+def parse_tokens_left(label):
+    """'0% used (3B tokens left)' / 'Đã dùng 4% (còn 12 tỷ token)' -> 3e9 / 12e9."""
+    if not label:
+        return None
+    m = _TOKENS_LEFT_RE.search(label)
+    if not m:
+        return None
+    num = m.group(1)
+    num = num.replace(",", "") if "." in num or num.count(",") != 1 else num.replace(",", ".")
+    unit = m.group(2) or ""
+    scale = _SCALE.get(unit.upper() if len(unit) == 1 else unit.lower(), 1)
+    try:
+        return int(round(float(num) * scale))
+    except ValueError:
+        return None
+
+
 def summarize_usage(sub):
-    """Flatten fetchSubscriptionAction's result into the numbers that matter."""
+    """Flatten fetchSubscriptionAction's result into the numbers that matter.
+
+    topupBalance/topupTotal are NOT tokens (a server-side unit; 120M of them
+    showed as "3B tokens left"). The web app uses them only for the bar
+    percent and prints the server's topupRowValueLabel verbatim, so do the
+    same: percent from the ratio, token count parsed from the label.
+    """
     tier = sub.get("tier") or {}
     usage = sub.get("usage") or {}
     resets = usage.get("resetsAt")
     total, balance = sub.get("topupTotal") or 0, sub.get("topupBalance") or 0
+    value_label = sub.get("topupRowValueLabel")
     bonus = None
-    if total > 0:
+    if total > 0 and value_label is not None and value_label.strip():
         used = total - min(max(balance, 0), total)
         bonus = {"label": sub.get("topupRowLabel") or "Additional tokens",
+                 "value_label": value_label,
                  "used_percent": round(100 * used / total),
-                 "remaining_tokens": balance, "total_tokens": total}
+                 "remaining_tokens": parse_tokens_left(value_label),
+                 "balance_units": balance, "total_units": total}
     return {
         "plan": tier.get("name"), "tier": tier.get("tierCode"), "paid": tier.get("isPaid"),
         "label": sub.get("usageRowLabel"),
+        "value_label": sub.get("usageRowValueLabel"),
         "state": usage.get("state"),
         "used_percent": usage.get("percentUsed"),
         "quota_status": usage.get("quotaStatus"),
@@ -353,7 +386,9 @@ def cmd_usage(args):
         out(u)
         return
     head = u["label"] or u["plan"] or "Plan"
-    if u["used_percent"] is not None:
+    if u["value_label"]:
+        line = f"{head}: {u['value_label']}"
+    elif u["used_percent"] is not None:
         line = f"{head}: {u['used_percent']}% used"
     else:
         line = f"{head}: {u['state'] or 'unknown'}"
@@ -364,13 +399,82 @@ def cmd_usage(args):
         print(f"  quota: {u['quota_status']}")
     b = u["bonus_tokens"]
     if b:
-        print(f"{b['label']}: {b['used_percent']}% used, "
-              f"{_human_tokens(b['remaining_tokens'])} of {_human_tokens(b['total_tokens'])}"
-              " tokens left (never expire)")
+        print(f"{b['label']}: {b['value_label']} (never expire)")
     else:
         print("Additional tokens: none")
     if u["upgrade"] and not u["paid"]:
         print("Upgrade: https://muse.ai/settings")
+
+
+def summarize_invite(d):
+    """The invite fields that matter, from GET /api/hatch/invite."""
+    reward = d.get("reward") if isinstance(d.get("reward"), dict) else None
+    remaining = d.get("uses_remaining")
+    if remaining is None and d.get("max_uses") is not None and d.get("use_count") is not None:
+        remaining = max(d["max_uses"] - d["use_count"], 0)
+    return {
+        "state": d.get("invite_state"),
+        "code": d.get("code"),
+        "link": d.get("invite_link"),
+        "max_uses": d.get("max_uses"),
+        "used": d.get("use_count"),
+        "uses_remaining": remaining,
+        "reward": ({"title": reward.get("title"), "body": reward.get("body")} if reward else None),
+        "offer": d.get("subtitle"),
+        "share_text": d.get("share_text"),
+        "redeemed_someone_elses_code": d.get("has_redeemed_invite_code"),
+    }
+
+
+def cmd_invite(args):
+    cfg = load_config()
+    if not os.path.exists(cfg["cookies_file"]):
+        connect(cfg)  # raises the usual "run auth export" error
+    cookies = load_cookies(cfg["cookies_file"])
+    d = fetch_invite(cookies)
+    if args.create and not d.get("code"):
+        create_invite(cookies)
+        d = fetch_invite(cookies)
+    if args.raw:
+        out(d)
+        return
+    s = summarize_invite(d)
+    if args.json:
+        out(s)
+        return
+    if s["code"]:
+        print(f"Invite code: {s['code']}")
+        if s["link"]:
+            print(f"Link: {s['link']}")
+        if s["uses_remaining"] is not None:
+            extra = f" of {s['max_uses']}" if s["max_uses"] is not None else ""
+            print(f"Uses left: {s['uses_remaining']}{extra}")
+    else:
+        print(f"Invite code: none yet (state {s['state']}). Open Invite friends in the "
+              "muse.ai app once, or run `muse-cli invite --create`.")
+    if s["reward"]:
+        print(" ".join(x for x in (s["reward"]["title"], s["reward"]["body"]) if x))
+    if s["offer"]:
+        print(s["offer"])
+
+
+def cmd_redeem(args):
+    cfg = load_config()
+    if not os.path.exists(cfg["cookies_file"]):
+        connect(cfg)
+    try:
+        status, body = redeem_invite_code(load_cookies(cfg["cookies_file"]), args.code)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+    if args.json:
+        out({"status": status, **body})
+    elif body.get("success"):
+        print(f"Redeemed: {body.get('redemptionStatus') or 'ok'}")
+    else:
+        print(f"Not redeemed ({body.get('reason')}): {body.get('detail') or ''}".rstrip(": "))
+    if not body.get("success"):
+        sys.exit(1)
 
 
 def cmd_threads(args):
@@ -915,6 +1019,15 @@ def main():
     p.add_argument("--json", action="store_true", help="print the summary as JSON")
     p.add_argument("--raw", action="store_true", help="print the server's full subscription object")
     p.set_defaults(fn=cmd_usage)
+    p = sub.add_parser("invite", help="your invite code, uses left, rewards earned (read-only)")
+    p.add_argument("--json", action="store_true", help="print the summary as JSON")
+    p.add_argument("--raw", action="store_true", help="print the server's full invite object")
+    p.add_argument("--create", action="store_true",
+                   help="create your code first if you have none (a write; no-op if one exists)")
+    p.set_defaults(fn=cmd_invite)
+    p = sub.add_parser("redeem", help="redeem a friend's invite code (within 48h of joining)")
+    p.add_argument("code"); p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_redeem)
     p = sub.add_parser("threads", help="list chats and side chats")
     p.add_argument("--all", dest="archived", action="store_true", help="include archived")
     p.set_defaults(fn=cmd_threads)
