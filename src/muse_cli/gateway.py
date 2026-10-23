@@ -6,6 +6,7 @@ No browser needed after the initial cookie export.
 """
 import json
 import os
+import re
 import struct
 import threading
 import time
@@ -164,6 +165,101 @@ def fetch_session_info(cookies):
         raise GatewayError(-1, f"VM unavailable ({info!r}); retry shortly or "
                                "`MUSE_VM_ID=<id> muse-cli wake`")
     return info
+
+
+# -- plan usage (Settings > Usage) ---------------------------------------------
+# The settings page reads usage through a Next.js server action
+# (fetchSubscriptionAction), not a REST route or a VM gateway method. A server
+# action is a POST to any app page with a `Next-Action: <id>` header; the id
+# is a hash that changes when the web app is redeployed, so it is looked up
+# again from the JS bundles when the known one stops working.
+SUBSCRIPTION_ACTION_NAME = "fetchSubscriptionAction"
+SUBSCRIPTION_ACTION_ID = "4029ac5c4bd03136487d91ebde5de39c64b35229b4"
+_ACTION_RE = re.compile(
+    r'createServerReference\)\("([0-9a-f]{20,})",[^)]{0,120}"' + SUBSCRIPTION_ACTION_NAME + '"')
+
+
+def parse_rsc_result(text):
+    """Return the action's return value from a text/x-component (RSC) body."""
+    rows = {}
+    for line in text.splitlines():
+        key, sep, val = line.partition(":")
+        if sep and val.startswith(("{", "[")):
+            try:
+                rows[key] = json.loads(val)
+            except ValueError:
+                pass
+    head = rows.get("0")
+    ref = head.get("a") if isinstance(head, dict) else None
+    if isinstance(ref, str) and ref.startswith("$@"):
+        return rows.get(ref[2:])
+    return rows.get("1", head)
+
+
+def find_action_id(cookies, name=SUBSCRIPTION_ACTION_NAME, page="https://muse.ai/settings"):
+    """Scan the web app's JS chunks for a server action's id (slow: ~1k files)."""
+    from concurrent.futures import ThreadPoolExecutor
+    h = {"User-Agent": UA, "Cookie": cookies}
+    html = rq.get(page, headers=h, impersonate="chrome", timeout=30).text
+    pat = re.compile(r'createServerReference\)\("([0-9a-f]{20,})",[^)]{0,120}"' + re.escape(name) + '"')
+    todo, seen = set(re.findall(r"/_next/static/chunks/[A-Za-z0-9_.-]+\.js", html)), set()
+
+    def get(path):
+        try:
+            return rq.get("https://muse.ai" + path, impersonate="chrome", timeout=30).text
+        except Exception:
+            return ""
+    with ThreadPoolExecutor(16) as ex:
+        while todo and len(seen) < 3000:
+            batch = list(todo - seen)
+            todo = set()
+            seen.update(batch)
+            for text in ex.map(get, batch):
+                m = pat.search(text)
+                if m:
+                    return m.group(1)
+                todo.update("/_next/" + c for c in
+                            re.findall(r"static/chunks/[A-Za-z0-9_.-]+\.js", text))
+    return None
+
+
+def _call_action(cookies, action_id, args, page="https://muse.ai/settings"):
+    h = _hatch_headers(cookies)
+    h.update({"Accept": "text/x-component", "Content-Type": "text/plain;charset=UTF-8",
+              "Next-Action": action_id})
+    r = rq.post(page, headers=h, data=json.dumps(args), impersonate="chrome", timeout=30)
+    if r.status_code in (401, 403):
+        raise AuthError(f"server action -> {r.status_code} (cookies expired? re-export)")
+    if r.status_code != 200 or "x-component" not in r.headers.get("content-type", ""):
+        return None  # most likely a stale action id
+    return parse_rsc_result(r.text)
+
+
+def fetch_subscription(cookies, action_id=None, include_agreement=False):
+    """Plan + usage as the Settings page shows it.
+
+    Returns (subscription_dict, action_id_used). Keys include tier{name,
+    tierCode,isPaid}, usage{state,percentUsed,resetsAt(unix s),quotaStatus},
+    statusSubtitle, usageRowLabel, topupBalance/topupTotal (tokens),
+    topupRowLabel, entryPointCtaLabel.
+    """
+    args = [{"includeAgreement": include_agreement}]
+    tried = []
+    for aid in (action_id, SUBSCRIPTION_ACTION_ID):
+        if aid and aid not in tried:
+            tried.append(aid)
+            res = _call_action(cookies, aid, args)
+            if res is not None:
+                break
+    else:
+        aid = find_action_id(cookies)
+        if not aid:
+            raise GatewayError(-1, f"could not find {SUBSCRIPTION_ACTION_NAME} in the web app bundle")
+        res = _call_action(cookies, aid, args)
+    if not isinstance(res, dict) or not res.get("success") or not res.get("subscription"):
+        err = res.get("error") if isinstance(res, dict) else res
+        raise GatewayError(-1, f"{SUBSCRIPTION_ACTION_NAME} failed: {err!r}")
+    return res["subscription"], aid
 
 
 class Gateway:
