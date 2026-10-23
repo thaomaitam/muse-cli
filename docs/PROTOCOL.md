@@ -117,3 +117,26 @@ chat / feed / goals / ideas / sessions / ...
   export follows the active tab, so a muse.ai tab has to be focused first,
   and it must never overwrite a working jar without a `hatch_sess` in the
   new one. A freshly launched browser has no login; do not fall back to one.
+
+## System Files (fs.*)
+
+All POST with JSON bodies; paths relative to the agent home (System Files
+root); absolute paths -> 400 "absolute paths are not allowed", `..` -> 400
+"path traversal is not allowed". Every field listed is required (serde 422
+otherwise). Responses are `{"ok":true,"result":{...}}` except `fs.list`.
+
+| method | body | result |
+|---|---|---|
+| `fs.list` | `{path}` (`""` = root) | `{path, entries:[{name,type:file|directory,size?,modifiedAt}]}` (not wrapped) |
+| `fs.stat` | `{path}` | `{path, kind:file|dir, size, modified_ms}` |
+| `fs.read` | `{path, offset, len}` | `{path, offset, len, eof, data_base64}` |
+| `fs.reads` | `{entries:[...]}` | batch read (unused) |
+| `fs.search` | `{name:{contains}}` or an extensions filter | `{entries:[{name,path,size,modified_ms}], total, has_more}`; index lags new files |
+| `fs.write` | `{path, overwrite, append, create_parent, data_base64 \| text}` | `{path, bytes_written, append}` |
+| `fs.mkdir` | `{path, recursive}` | `{path, created}` |
+| `fs.rename` | `{source, destination, overwrite, create_parent}` | `{source, destination}` |
+| `fs.delete` | `{path, recursive}` | `{path}` |
+
+`fs.read` of some home files (IDENTITY.md ...) returns a longer body than
+`fs.list`'s size: the server prepends an "About this file" note. muse-cli
+reads in 4 MiB windows until `eof` and writes in 4 MiB append chunks.

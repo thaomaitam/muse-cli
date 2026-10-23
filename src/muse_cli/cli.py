@@ -975,6 +975,119 @@ def cmd_raw(args):
         gw.close()
 
 
+# -- System Files (fs) ---------------------------------------------------------
+def _fs(args, fn):
+    from .fs import FS
+    gw = connect(load_config())
+    try:
+        return fn(FS(gw))
+    finally:
+        gw.close()
+
+
+def cmd_fs_ls(args):
+    from .fs import fmt_size
+    def run(fs):
+        ents = fs.list_dir(args.path)
+        if not args.all:
+            ents = [e for e in ents if not e["name"].startswith(".")]
+        if args.json:
+            return out(ents)
+        for e in ents:
+            name = e["name"] + ("/" if e.get("type") == "directory" else "")
+            if args.long:
+                print(f"{e.get('type','?')[0]} {fmt_size(e.get('size')):>7} {e.get('modifiedAt','')[:19]:19} {name}")
+            else:
+                print(name)
+    _fs(args, run)
+
+
+def cmd_fs_tree(args):
+    def run(fs):
+        rows = [(r, e, lvl) for r, e, lvl in fs.walk(args.path, args.depth)
+                if args.all or not any(x.startswith(".") for x in r.split("/"))]
+        if args.json:
+            return out([{"path": r, **e} for r, e, _ in rows])
+        print(args.path or "/")
+        for r, e, lvl in rows:
+            print("  " * (lvl + 1) + e["name"] + ("/" if e.get("type") == "directory" else ""))
+    _fs(args, run)
+
+
+def cmd_fs_stat(args):
+    _fs(args, lambda fs: out(fs.stat(args.path)))
+
+
+def cmd_fs_cat(args):
+    def run(fs):
+        data = fs.read_file(args.path, max_bytes=args.max_bytes)
+        if b"\0" in data[:8192] and not args.binary:
+            print(f"{args.path}: binary file ({len(data)} bytes); use `fs get` or --binary", file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.buffer.write(data)
+        sys.stdout.flush()
+    _fs(args, run)
+
+
+def cmd_fs_get(args):
+    def run(fs):
+        os.makedirs(args.output, exist_ok=True)
+        out({"saved": fs.get(args.path, args.output, recursive=args.recursive)})
+    _fs(args, run)
+
+
+def cmd_fs_find(args):
+    _fs(args, lambda fs: out(fs.search(args.name, args.limit)))
+
+
+def cmd_fs_put(args):
+    _fs(args, lambda fs: out(fs.put(args.local, args.remote, recursive=args.recursive,
+                                    overwrite=not args.no_clobber)))
+
+
+def cmd_fs_write(args):
+    data = sys.stdin.buffer.read()
+    def run(fs):
+        if args.append:
+            data2 = fs.read_file(args.remote) + data
+            return out(fs.write_file(args.remote, data2))
+        out(fs.write_file(args.remote, data, overwrite=not args.no_clobber))
+    _fs(args, run)
+
+
+def cmd_fs_edit(args):
+    from .fs import apply_replace, edit_in_editor
+    def run(fs):
+        before = fs.read_file(args.remote)
+        if args.replace:
+            text = before.decode("utf-8")
+            for old, new in args.replace:
+                text = apply_replace(text, old, new)
+            after = text.encode("utf-8")
+        else:
+            after = edit_in_editor(before, os.path.splitext(args.remote)[1])
+        if after == before:
+            return out({"path": args.remote, "changed": False})
+        r = fs.write_file(args.remote, after, overwrite=True)
+        out({**r, "changed": True})
+    _fs(args, run)
+
+
+def cmd_fs_mkdir(args):
+    _fs(args, lambda fs: out(fs.mkdir(args.path, parents=True)))
+
+
+def cmd_fs_mv(args):
+    _fs(args, lambda fs: out(fs.move(args.src, args.dst, overwrite=args.force)))
+
+
+def cmd_fs_rm(args):
+    if not args.yes:
+        print("refusing to delete without --yes", file=sys.stderr)
+        sys.exit(2)
+    _fs(args, lambda fs: out(fs.delete(args.path, recursive=args.recursive)))
+
+
 def _chat(args):
     from .chat import cmd_chat
     cmd_chat(args)
@@ -1086,6 +1199,40 @@ def main():
         p.set_defaults(fn=cmd_session_op(kind))
     sub.add_parser("wake", help="request a VM wake").set_defaults(fn=cmd_wake)
     sub.add_parser("update", help="upgrade this install to the latest release").set_defaults(fn=cmd_update)
+    p = sub.add_parser("fs", help="browse/read/write Muse's System Files (agent home)")
+    f = p.add_subparsers(dest="op", required=True)
+    q = f.add_parser("ls", help="list a folder (default: System Files root)")
+    q.add_argument("path", nargs="?", default=""); q.add_argument("-l", "--long", action="store_true")
+    q.add_argument("-a", "--all", action="store_true", help="include dotfiles")
+    q.add_argument("--json", action="store_true"); q.set_defaults(fn=cmd_fs_ls)
+    q = f.add_parser("tree", help="recursive listing")
+    q.add_argument("path", nargs="?", default=""); q.add_argument("--depth", type=int, default=2)
+    q.add_argument("-a", "--all", action="store_true"); q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_fs_tree)
+    q = f.add_parser("stat", help="file/folder metadata"); q.add_argument("path"); q.set_defaults(fn=cmd_fs_stat)
+    q = f.add_parser("cat", help="print a file"); q.add_argument("path")
+    q.add_argument("--max-bytes", type=int, default=None); q.add_argument("--binary", action="store_true")
+    q.set_defaults(fn=cmd_fs_cat)
+    q = f.add_parser("get", help="download a file (or folder with -r)"); q.add_argument("path")
+    q.add_argument("-o", "--output", default="."); q.add_argument("-r", "--recursive", action="store_true")
+    q.set_defaults(fn=cmd_fs_get)
+    q = f.add_parser("find", help="search by name substring"); q.add_argument("name")
+    q.add_argument("--limit", type=int, default=None); q.set_defaults(fn=cmd_fs_find)
+    q = f.add_parser("put", help="upload a local file (or folder with -r)")
+    q.add_argument("local"); q.add_argument("remote"); q.add_argument("-r", "--recursive", action="store_true")
+    q.add_argument("-n", "--no-clobber", action="store_true"); q.set_defaults(fn=cmd_fs_put)
+    q = f.add_parser("write", help="write stdin to a remote file"); q.add_argument("remote")
+    q.add_argument("--append", action="store_true"); q.add_argument("-n", "--no-clobber", action="store_true")
+    q.set_defaults(fn=cmd_fs_write)
+    q = f.add_parser("edit", help="edit a remote file in $EDITOR or with --replace OLD NEW")
+    q.add_argument("remote"); q.add_argument("--replace", nargs=2, action="append", metavar=("OLD", "NEW"))
+    q.set_defaults(fn=cmd_fs_edit)
+    q = f.add_parser("mkdir", help="create a folder (with parents)"); q.add_argument("path"); q.set_defaults(fn=cmd_fs_mkdir)
+    q = f.add_parser("mv", help="move/rename"); q.add_argument("src"); q.add_argument("dst")
+    q.add_argument("-f", "--force", action="store_true", help="overwrite destination"); q.set_defaults(fn=cmd_fs_mv)
+    q = f.add_parser("rm", help="delete (requires --yes)"); q.add_argument("path")
+    q.add_argument("-r", "--recursive", action="store_true"); q.add_argument("--yes", action="store_true")
+    q.set_defaults(fn=cmd_fs_rm)
     p = sub.add_parser("raw", help="call any gateway method (escape hatch)")
     p.add_argument("method"); p.add_argument("--body", default=None)
     p.add_argument("--param", action="append", default=[], help="path param k=v (repeatable)")
@@ -1106,6 +1253,9 @@ def main():
         except GatewayError as e:
             print(f"gateway error: {e}", file=sys.stderr)
             sys.exit(3)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(2)
         except TimeoutError as e:
             print(f"timeout: {e}", file=sys.stderr)
             sys.exit(4)
