@@ -187,6 +187,18 @@ muse-cli session-rename <id> "new title"
 muse-cli session-archive <id>                     # also: pin, unpin, unarchive, delete
 muse-cli seen <thread-id>
 muse-cli wake
+
+muse-cli fs ls [PATH] [-l] [-a] [--json]           # System Files (agent home); "" or / is the root
+muse-cli fs tree memory --depth 3                 # recursive listing
+muse-cli fs stat MEMORY.md
+muse-cli fs cat config/home.yaml                  # text to stdout (binary refused unless --binary)
+muse-cli fs get workspace/imagine_media/x.mp4 -o ./out   # download (-r for folders)
+muse-cli fs find hello                            # search by name substring
+muse-cli fs put ./notes.md docs/notes.md          # upload (-r for folders, -n no-clobber)
+echo hi | muse-cli fs write data/hi.txt           # stdin -> file (--append)
+muse-cli fs edit docs/notes.md --replace OLD NEW  # or no flags: opens $EDITOR
+muse-cli fs mkdir data/new ; muse-cli fs mv a b [-f] ; muse-cli fs rm PATH [-r] --yes
+
 muse-cli raw <method> --body '{}'                 # escape hatch: any of 258 gateway methods
 ```
 
