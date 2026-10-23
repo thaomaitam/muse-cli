@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import __version__
-from .gateway import Gateway, AuthError, GatewayError, load_cookies
+from .gateway import Gateway, AuthError, GatewayError, fetch_subscription, load_cookies
 from .update import cmd_update, finish_update_check, start_update_check
 
 CONFIG_DIR = os.path.expanduser("~/.config/muse-cli")
@@ -300,6 +300,77 @@ def cmd_status(_args):
              "unread": unread, "identity": ident})
     finally:
         gw.close()
+
+
+def summarize_usage(sub):
+    """Flatten fetchSubscriptionAction's result into the numbers that matter."""
+    tier = sub.get("tier") or {}
+    usage = sub.get("usage") or {}
+    resets = usage.get("resetsAt")
+    total, balance = sub.get("topupTotal") or 0, sub.get("topupBalance") or 0
+    bonus = None
+    if total > 0:
+        used = total - min(max(balance, 0), total)
+        bonus = {"label": sub.get("topupRowLabel") or "Additional tokens",
+                 "used_percent": round(100 * used / total),
+                 "remaining_tokens": balance, "total_tokens": total}
+    return {
+        "plan": tier.get("name"), "tier": tier.get("tierCode"), "paid": tier.get("isPaid"),
+        "label": sub.get("usageRowLabel"),
+        "state": usage.get("state"),
+        "used_percent": usage.get("percentUsed"),
+        "quota_status": usage.get("quotaStatus"),
+        "resets_at": (time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(resets))
+                      if resets else None),
+        "status": sub.get("statusSubtitle"),
+        "bonus_tokens": bonus,
+        "upgrade": sub.get("entryPointCtaLabel"),
+    }
+
+
+def _human_tokens(n):
+    for div, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= div:
+            return f"{n / div:.1f}".rstrip("0").rstrip(".") + unit
+    return str(n)
+
+
+def cmd_usage(args):
+    cfg = load_config()
+    if not os.path.exists(cfg["cookies_file"]):
+        connect(cfg)  # raises the usual "run auth export" error
+    sub, aid = fetch_subscription(load_cookies(cfg["cookies_file"]),
+                                  action_id=cfg.get("subscription_action_id"))
+    if cfg.get("subscription_action_id") != aid:
+        cfg["subscription_action_id"] = aid
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
+    if args.raw:
+        out(sub)
+        return
+    u = summarize_usage(sub)
+    if args.json:
+        out(u)
+        return
+    head = u["label"] or u["plan"] or "Plan"
+    if u["used_percent"] is not None:
+        line = f"{head}: {u['used_percent']}% used"
+    else:
+        line = f"{head}: {u['state'] or 'unknown'}"
+    if u["resets_at"]:
+        line += f" (resets {u['resets_at'][:16].replace('T', ' ')} {time.strftime('%Z')})"
+    print(line)
+    if u["quota_status"] and u["quota_status"] != "SUFFICIENT":
+        print(f"  quota: {u['quota_status']}")
+    b = u["bonus_tokens"]
+    if b:
+        print(f"{b['label']}: {b['used_percent']}% used, "
+              f"{_human_tokens(b['remaining_tokens'])} of {_human_tokens(b['total_tokens'])}"
+              " tokens left (never expire)")
+    else:
+        print("Additional tokens: none")
+    if u["upgrade"] and not u["paid"]:
+        print("Upgrade: https://muse.ai/settings")
 
 
 def cmd_threads(args):
@@ -840,6 +911,10 @@ def main():
 
     sub.add_parser("chat", help="interactive chat (the default with no command)").set_defaults(fn=_chat)
     sub.add_parser("status", help="VM, session count, unread, identity").set_defaults(fn=cmd_status)
+    p = sub.add_parser("usage", help="plan usage: weekly limit %% used, reset date, bonus tokens")
+    p.add_argument("--json", action="store_true", help="print the summary as JSON")
+    p.add_argument("--raw", action="store_true", help="print the server's full subscription object")
+    p.set_defaults(fn=cmd_usage)
     p = sub.add_parser("threads", help="list chats and side chats")
     p.add_argument("--all", dest="archived", action="store_true", help="include archived")
     p.set_defaults(fn=cmd_threads)

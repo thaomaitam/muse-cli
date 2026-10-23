@@ -75,6 +75,19 @@ chat / feed / goals / ideas / sessions / ...
   not in `routes.json`; sent as a raw-path daemon request over the Noise
   tunnel it returns the file (body chunks). `Gateway.download_file()` wraps
   this. `artifacts.fetch_url` is unrelated (needs `project_dir`).
+- **Plan usage** (Settings > Usage) is not a REST route or a gateway method.
+  It is the Next.js server action `fetchSubscriptionAction`: `POST
+  https://muse.ai/settings` with cookies, `Next-Action: <id>`, `Accept:
+  text/x-component`, body `[{"includeAgreement":false}]`. The RSC reply is
+  `0:{"a":"$@1",...}` then `1:{"success":true,"subscription":{tier, usage:
+  {state, percentUsed, resetsAt (unix s), quotaStatus}, statusSubtitle,
+  usageRowLabel, topupBalance, topupTotal, topupRowLabel,
+  entryPointCtaLabel, ...}}`. The bonus token % is the web app's own
+  `round(100*(total-clamp(balance))/total)`. The action id is a build hash
+  (`4029ac5c...` as of 2026-10-23); when it stops working the client looks it
+  up again by scanning `/_next/static/chunks/*.js` for
+  `createServerReference)("<id>",...,"fetchSubscriptionAction")`, then caches
+  it as `subscription_action_id` in config.json.
 - `session.start`: `{method: "/api/session/start", params: {origin: "fresh",
   lifecycle: "persistent", title?}}`.
 - `session.rename`: flat `{session_id, title}`. pin/unpin/archive/unarchive/

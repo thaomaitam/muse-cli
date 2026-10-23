@@ -166,6 +166,8 @@ muse-cli history --limit 5                        # recent messages
 muse-cli history --thread <session-id> --limit 5  # one side chat
 muse-cli send "summarize my unread" --wait 120    # send + wait for the reply
 muse-cli watch --timeout 60                       # tail live agent events
+muse-cli usage                                    # plan: weekly limit % used, reset, bonus tokens
+muse-cli usage --json                             # same, as JSON (--raw: full server object)
 muse-cli files --limit 20                         # images/videos in recent messages
 muse-cli download <seq|message-id|sandbox://...> -o ./out   # save agent-made files
 muse-cli history --limit 3 --download ./out       # save files from these messages
