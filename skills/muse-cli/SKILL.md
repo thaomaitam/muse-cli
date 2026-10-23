@@ -179,8 +179,8 @@ only for methods with no wrapper.
 - `send --wait 0` is fire-and-forget (no polling).
 - `history` without `--thread` reads the main chat only.
 - `invite` prints "none yet" until the code exists. The code is created
-  when the Invite friends sheet is opened in the app (a POST); muse-cli
-  never sends that POST or any redeem call.
+  when the Invite friends sheet is opened in the app, or by `invite
+  --create` (POST /api/hatch/invite, only sent when there is no code yet).
 - `usage` goes to muse.ai with cookies only (no VM connection), so it still works
   while the VM sleeps. The first run after a web app deploy may take a few
   seconds while it re-finds the action id in the JS bundle.

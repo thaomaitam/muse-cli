@@ -287,6 +287,22 @@ def fetch_invite(cookies):
     return d
 
 
+def create_invite(cookies):
+    """Create this account's invite code (WRITES; what opening Invite friends does).
+
+    POST https://muse.ai/api/hatch/invite, no body. Returns {code, max_uses,
+    use_count, invite_link, share_text}. Only needed while GET returns
+    code: null.
+    """
+    r = rq.post("https://muse.ai/api/hatch/invite", headers=_hatch_headers(cookies),
+                data=b"", impersonate="chrome", timeout=30)
+    if r.status_code in (401, 403):
+        raise AuthError(f"api/hatch/invite POST -> {r.status_code} (cookies expired? re-export)")
+    if r.status_code != 200:
+        raise GatewayError(r.status_code, r.text[:200])
+    return r.json()
+
+
 def redeem_invite_code(cookies, code):
     """Redeem a friend's invite code (WRITES account state; one-shot).
 

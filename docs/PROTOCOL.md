@@ -92,8 +92,10 @@ chat / feed / goals / ideas / sessions / ...
   `GET /api/hatch/invite` returns `{invite_state, code, invite_link,
   max_uses, use_count, uses_remaining, share_text, reward{title, body},
   subtitle, has_redeemed_invite_code, redeem_invite_code_screen, ...}`. The
-  earned stats come only as display text in `reward`. `POST` to the same URL
-  creates the code (state-changing, the client never calls it); codes match
+  earned stats come only as display text in `reward`. `POST` (no body) to the same URL
+  creates the code and returns `{code, max_uses (30), use_count, invite_link
+  (https://muse.ai/join), share_text}`; `invite --create` sends it only when
+  GET shows `code: null`; codes match
   `^[A-Z0-9]{6,16}$`. Found via `useHatchInvitePageQuery` in the bundle.
 - **Redeem a code:** `POST /api/hatch/invite-code/redeem` `{code,
   supportsRedemptionStatus: true}`. Success: `{success: true,

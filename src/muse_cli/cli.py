@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import __version__
-from .gateway import Gateway, AuthError, GatewayError, fetch_invite, fetch_subscription, redeem_invite_code, load_cookies
+from .gateway import Gateway, AuthError, GatewayError, create_invite, fetch_invite, fetch_subscription, redeem_invite_code, load_cookies
 from .update import cmd_update, finish_update_check, start_update_check
 
 CONFIG_DIR = os.path.expanduser("~/.config/muse-cli")
@@ -397,7 +397,11 @@ def cmd_invite(args):
     cfg = load_config()
     if not os.path.exists(cfg["cookies_file"]):
         connect(cfg)  # raises the usual "run auth export" error
-    d = fetch_invite(load_cookies(cfg["cookies_file"]))
+    cookies = load_cookies(cfg["cookies_file"])
+    d = fetch_invite(cookies)
+    if args.create and not d.get("code"):
+        create_invite(cookies)
+        d = fetch_invite(cookies)
     if args.raw:
         out(d)
         return
@@ -414,7 +418,7 @@ def cmd_invite(args):
             print(f"Uses left: {s['uses_remaining']}{extra}")
     else:
         print(f"Invite code: none yet (state {s['state']}). Open Invite friends in the "
-              "muse.ai app once to create it; muse-cli only reads.")
+              "muse.ai app once, or run `muse-cli invite --create`.")
     if s["reward"]:
         print(" ".join(x for x in (s["reward"]["title"], s["reward"]["body"]) if x))
     if s["offer"]:
@@ -985,6 +989,8 @@ def main():
     p = sub.add_parser("invite", help="your invite code, uses left, rewards earned (read-only)")
     p.add_argument("--json", action="store_true", help="print the summary as JSON")
     p.add_argument("--raw", action="store_true", help="print the server's full invite object")
+    p.add_argument("--create", action="store_true",
+                   help="create your code first if you have none (a write; no-op if one exists)")
     p.set_defaults(fn=cmd_invite)
     p = sub.add_parser("redeem", help="redeem a friend's invite code (within 48h of joining)")
     p.add_argument("code"); p.add_argument("--json", action="store_true")
