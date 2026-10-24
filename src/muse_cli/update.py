@@ -65,9 +65,13 @@ def upgrade_argv():
         return ["git", "-C", root, "pull", "--ff-only"]
     prefix = os.path.realpath(sys.prefix)
     sep = os.sep
-    if f"{sep}uv{sep}tools{sep}" in prefix:
+    # uv and pipx leave a receipt in the tool env; the path check covers
+    # default locations when the receipt is missing.
+    if (f"{sep}uv{sep}tools{sep}" in prefix
+            or os.path.isfile(os.path.join(prefix, "uv-receipt.toml"))):
         return ["uv", "tool", "install", "--upgrade", INSTALL_SPEC]
-    if f"{sep}pipx{sep}" in prefix:
+    if (f"{sep}pipx{sep}" in prefix
+            or os.path.isfile(os.path.join(prefix, "pipx_metadata.json"))):
         return ["pipx", "install", "--force", INSTALL_SPEC]
     return [sys.executable, "-m", "pip", "install", "-U", INSTALL_SPEC]
 

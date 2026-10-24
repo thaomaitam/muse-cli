@@ -75,6 +75,12 @@ class UpgradeArgvTest(unittest.TestCase):
         argv = self._argv("/home/u/.local/share/uv/tools/muse-cli")
         self.assertEqual(argv, ["uv", "tool", "install", "--upgrade", update.INSTALL_SPEC])
 
+    def test_uv_receipt_in_custom_tool_dir(self):
+        prefix = tempfile.mkdtemp()
+        open(os.path.join(prefix, "uv-receipt.toml"), "w").close()
+        argv = self._argv(prefix)
+        self.assertEqual(argv, ["uv", "tool", "install", "--upgrade", update.INSTALL_SPEC])
+
     def test_pipx_reinstalls_from_fork(self):
         argv = self._argv("/home/u/.local/share/pipx/venvs/muse-cli")
         self.assertEqual(argv, ["pipx", "install", "--force", update.INSTALL_SPEC])
