@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# muse-cli installer: CLI (from PyPI, via uv) + agent skill. No browser needed afterwards.
-# Usage: curl -fsSL https://raw.githubusercontent.com/nikships/muse-cli/main/install.sh | bash
+# muse-cli installer: CLI (from the thoitiettxl-cyber fork, via uv) + agent skill.
+# No browser needed afterwards. Never installs from PyPI or upstream.
+# Usage: curl -fsSL https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/install.sh | bash
 set -u
 
-REPO_URL="${MUSE_CLI_REPO:-https://github.com/nikships/muse-cli.git}"
-RAW_URL="${MUSE_CLI_RAW:-https://raw.githubusercontent.com/nikships/muse-cli/main}"
+REPO_URL="${MUSE_CLI_REPO:-https://github.com/thoitiettxl-cyber/muse-cli.git}"
+RAW_URL="${MUSE_CLI_RAW:-https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main}"
 # Skill target: MUSE_CLI_SKILLS wins; on a Grok Bot box use the shared skill
 # folder every assistant can read; otherwise the generic agents path.
 GROKBOT_WORKFLOWS="/home/box/agent-data/workflows"
@@ -29,11 +30,8 @@ if ! command -v uv >/dev/null; then
 fi
 command -v uv >/dev/null || fail "uv not found after install"
 
-echo "installing $BIN_NAME with uv"
-if ! uv tool install --upgrade muse-cli; then
-  echo "PyPI install failed, installing from $REPO_URL"
-  uv tool install --upgrade "git+$REPO_URL" || fail "uv tool install failed"
-fi
+echo "installing $BIN_NAME with uv from $REPO_URL"
+uv tool install --upgrade "git+$REPO_URL" || fail "uv tool install failed"
 
 # Older installers wrote a launcher into ~/bin that runs a git checkout's
 # cli.py; it would shadow the new command and break once the checkout updates.
@@ -108,9 +106,9 @@ echo "      hatch_sess=VALUE; other_name=other_value"
 echo "    chmod 600 ~/.config/muse-cli/cookies.txt"
 echo "    $BIN_NAME status"
 echo
-echo "Full write-up: https://github.com/nikships/muse-cli#log-in-once"
+echo "Full write-up: https://github.com/thoitiettxl-cyber/muse-cli#log-in-once"
 echo
-echo "Updates: in a terminal, $BIN_NAME notices a newer PyPI release once a day."
+echo "Updates: in a terminal, $BIN_NAME notices a newer version on the fork's main once a day."
 echo "Upgrade with: $BIN_NAME update"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

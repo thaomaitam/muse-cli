@@ -1,11 +1,19 @@
-"""Tell an interactive user when a newer muse-cli is on PyPI.
+"""Tell an interactive user when a newer muse-cli is on the fork's main.
+
+This build tracks only the fork at github.com/thoitiettxl-cyber/muse-cli,
+never PyPI or upstream. The check reads `__version__` from the fork's main
+branch over an unauthenticated raw fetch.
 
 Same shape as `gh` and `uv`: look at most once a day, never on a pipe or in
 CI, never fail the command, and print the upgrade command instead of
 replacing the install. uv tools do not upgrade themselves.
+
+A source checkout (editable or plain git clone) is never replaced: `update`
+prints the `git pull` to run instead.
 """
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -17,7 +25,11 @@ from . import __version__
 CHECK_INTERVAL = 24 * 60 * 60
 FAIL_BACKOFF = 60 * 60
 STATE_FILE = os.path.expanduser("~/.config/muse-cli/update.json")
-PYPI_URL = "https://pypi.org/pypi/muse-cli/json"
+FORK = "thoitiettxl-cyber/muse-cli"
+REPO_URL = f"https://github.com/{FORK}.git"
+INSTALL_SPEC = f"git+{REPO_URL}"
+VERSION_URL = f"https://raw.githubusercontent.com/{FORK}/main/src/muse_cli/__init__.py"
+_VERSION_RE = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.M)
 
 
 def version_key(value):
@@ -36,15 +48,28 @@ def is_newer(latest, current):
     return bool(new and old and new > old)
 
 
+def source_checkout(pkg_file=None):
+    """Repo root when running from a git checkout (editable install), else None."""
+    pkg_dir = os.path.dirname(os.path.realpath(pkg_file or __file__))
+    root = os.path.dirname(os.path.dirname(pkg_dir))  # src/muse_cli -> repo
+    if os.path.exists(os.path.join(root, ".git")) and os.path.isfile(
+            os.path.join(root, "pyproject.toml")):
+        return root
+    return None
+
+
 def upgrade_argv():
-    """The upgrade command for this install. uv tool, pipx, or pip."""
+    """The upgrade command for this install: git pull, uv tool, pipx, or pip."""
+    root = source_checkout()
+    if root:
+        return ["git", "-C", root, "pull", "--ff-only"]
     prefix = os.path.realpath(sys.prefix)
     sep = os.sep
     if f"{sep}uv{sep}tools{sep}" in prefix:
-        return ["uv", "tool", "upgrade", "muse-cli"]
+        return ["uv", "tool", "install", "--upgrade", INSTALL_SPEC]
     if f"{sep}pipx{sep}" in prefix:
-        return ["pipx", "upgrade", "muse-cli"]
-    return [sys.executable, "-m", "pip", "install", "-U", "muse-cli"]
+        return ["pipx", "install", "--force", INSTALL_SPEC]
+    return [sys.executable, "-m", "pip", "install", "-U", INSTALL_SPEC]
 
 
 def upgrade_command():
@@ -82,14 +107,19 @@ def _save_state(data):
         pass
 
 
+def parse_version(text):
+    match = _VERSION_RE.search(text or "")
+    if not match:
+        raise ValueError("no __version__ found")
+    return match.group(1)
+
+
 def _fetch_latest():
     req = urllib.request.Request(
-        PYPI_URL,
-        headers={"Accept": "application/json", "User-Agent": f"muse-cli/{__version__}"},
+        VERSION_URL, headers={"User-Agent": f"muse-cli/{__version__}"},
     )
     with urllib.request.urlopen(req, timeout=2) as resp:
-        payload = json.loads(resp.read().decode())
-    return str(payload["info"]["version"])
+        return parse_version(resp.read().decode())
 
 
 def start_update_check():
@@ -109,7 +139,7 @@ def start_update_check():
             holder["latest"] = found
             _save_state({"checked_at": time.time(), "latest": found})
         except Exception:
-            # Offline or PyPI blip: try again in an hour, keep any known version.
+            # Offline or GitHub blip: try again in an hour, keep any known version.
             holder["latest"] = latest or None
             _save_state({
                 "checked_at": time.time() - CHECK_INTERVAL + FAIL_BACKOFF,
@@ -140,6 +170,12 @@ def finish_update_check(holder):
 
 
 def cmd_update(_args):
+    root = source_checkout()
+    if root:
+        # Never swap a checkout for a remote install; the user owns this tree.
+        print(f"muse-cli runs from a source checkout at {root}.", file=sys.stderr)
+        print(f"To update it, run: git -C {root} pull --ff-only", file=sys.stderr)
+        return
     argv = upgrade_argv()
     if argv[0] != sys.executable and shutil.which(argv[0]) is None:
         print(f"{argv[0]} is not on PATH.", file=sys.stderr)
