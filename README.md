@@ -4,8 +4,8 @@
 
 Talk to your personal muse.ai AI agent from the terminal.
 
-[![PyPI](https://img.shields.io/pypi/v/muse-cli?style=for-the-badge)](https://pypi.org/project/muse-cli/)
-[![Python](https://img.shields.io/pypi/pyversions/muse-cli?style=for-the-badge)](https://pypi.org/project/muse-cli/)
+[![Version](https://img.shields.io/github/v/tag/thoitiettxl-cyber/muse-cli?style=for-the-badge&label=version)](https://github.com/thoitiettxl-cyber/muse-cli/tags)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=for-the-badge)](https://github.com/thoitiettxl-cyber/muse-cli/blob/main/pyproject.toml)
 [![Downloads](https://img.shields.io/pepy/dt/muse-cli?style=for-the-badge)](https://pepy.tech/project/muse-cli)
 [![License: MIT](https://img.shields.io/github/license/nikships/muse-cli?style=for-the-badge)](https://github.com/nikships/muse-cli/blob/main/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/nikships/muse-cli?style=for-the-badge)](https://github.com/nikships/muse-cli/stargazers)

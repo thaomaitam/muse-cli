@@ -7,8 +7,11 @@
 - `pyproject.toml` holds all packaging metadata (hatchling). The version is
   read from `__version__` in `src/muse_cli/__init__.py`; that is the only
   place it lives.
-- `.github/workflows/publish.yml` builds and smoke-tests on every push to
-  `main` and on PRs, and publishes to PyPI only on `v*` tags.
+- Fork-only: this repo is github.com/thoitiettxl-cyber/muse-cli. Never install
+  from, publish to, or point anything at PyPI or upstream nikships/muse-cli
+  (they lack the fork's fixes). Installs come from `git+` the fork's `main`.
+- No CI: there are no GitHub Actions workflows (the account has no Actions
+  minutes). Run tests locally before pushing.
 
 ## Rule for agents driving Muse from an agent: never poll
 
@@ -35,8 +38,12 @@
 
 ## Cutting a release
 
-When asked to "cut a release", "publish a new version", or similar, follow
-these steps in order. Stop and report if any step fails.
+There is no PyPI and no CI. A release is a version bump on the fork's `main`;
+`install.sh` and `muse-cli update` install `git+https://github.com/thoitiettxl-cyber/muse-cli.git`
+(main), and the daily update notice compares the installed version with
+`__version__` in `src/muse_cli/__init__.py` on main. When asked to "cut a
+release", "publish a new version", or similar, follow these steps in order.
+Stop and report if any step fails.
 
 1. **Pick the version.** Use the version the user gave. If they didn't give
    one, propose one using semantic versioning (patch for fixes, minor for
@@ -46,80 +53,65 @@ these steps in order. Stop and report if any step fails.
    ```bash
    git fetch --tags origin
    git tag -l 'v*'
-   curl -s https://pypi.org/pypi/muse-cli/json | python3 -c 'import sys,json;print(sorted(json.load(sys.stdin)["releases"]))'
    ```
 
-   Never reuse a version. `v0.1.0` exists as a GitHub-only tag from before
-   PyPI publishing; PyPI releases start at 0.2.0.
-
-2. **Check the working tree.** Be on `main`, up to date with `origin/main`,
-   with no uncommitted changes (`git status -sb`). Git author identity must
-   already be configured; never set it yourself.
+2. **Check the working tree.** Be on `main`, up to date with `origin/main`
+   (`thoitiettxl-cyber/muse-cli`), with no uncommitted changes
+   (`git status -sb`). Git author identity must already be configured; never
+   set it yourself.
 
 3. **Bump the version** in `src/muse_cli/__init__.py`, nothing else.
+   `pyproject.toml` reads it from there (`dynamic = ["version"]`); don't add a
+   version to `pyproject.toml`.
 
-4. **Build and smoke-test locally:**
+4. **Test locally** (no CI will do it for you):
 
    ```bash
-   rm -rf dist /tmp/muse-release && python3 -m venv /tmp/muse-release
-   /tmp/muse-release/bin/pip install -q build twine
-   /tmp/muse-release/bin/python -m build
-   /tmp/muse-release/bin/twine check --strict dist/*
-   /tmp/muse-release/bin/pip install -q dist/*.whl
+   uv run --no-project --with-editable . --with pytest pytest -q tests
+   rm -rf /tmp/muse-release && uv venv -q /tmp/muse-release
+   uv pip install -q --python /tmp/muse-release/bin/python .
    /tmp/muse-release/bin/muse-cli --version   # must print the new version
-   rm -rf dist
+   rm -rf /tmp/muse-release
    ```
 
-5. **Commit and push the bump**, then wait for the build job on `main` to
-   pass:
+5. **Commit and push the bump to the fork's main.** This is the release:
+   installs and `muse-cli update` pick it up from main.
 
    ```bash
-   git commit -am "Bump version to X.Y.Z"
+   git commit -am "chore(release): bump version to X.Y.Z"
    git push origin main
-   gh run list --workflow publish.yml --limit 1   # get the run id
-   gh run watch <run-id> --exit-status
    ```
 
-6. **Tag and push the tag.** This is what publishes to PyPI:
+6. **Optional: tag and create a GitHub release** on the fork:
 
    ```bash
    git tag -a vX.Y.Z -m "muse-cli X.Y.Z"
    git push origin vX.Y.Z
-   gh run list --workflow publish.yml --limit 1
-   gh run watch <run-id> --exit-status
+   gh release create vX.Y.Z -R thoitiettxl-cyber/muse-cli --title "muse-cli X.Y.Z" --generate-notes
    ```
-
-   The workflow checks the tag matches `__version__`, builds, uploads to
-   PyPI via trusted publishing (no token needed), and creates the GitHub
-   release with auto-generated notes and the built files attached. Do not
-   create the GitHub release by hand.
 
 7. **Verify it is live:**
 
    ```bash
-   curl -s https://pypi.org/pypi/muse-cli/json | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])'
-   rm -rf /tmp/muse-verify && python3 -m venv /tmp/muse-verify
-   /tmp/muse-verify/bin/pip install -q --no-cache-dir muse-cli==X.Y.Z
-   /tmp/muse-verify/bin/muse-cli --version
+   curl -fsSL https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/src/muse_cli/__init__.py | grep __version__
+   uv tool run --from git+https://github.com/thoitiettxl-cyber/muse-cli.git muse-cli --version
    ```
 
-   PyPI can take a minute to show a new version; retry before assuming
-   failure. Report the PyPI and GitHub release links when done.
+   raw.githubusercontent.com can cache for a few minutes; retry before
+   assuming failure. Report the commit (and release, if made) links.
 
 ### If something goes wrong
 
-- **Failed before the PyPI upload step** (tag check, build, smoke test):
-  nothing was published. Fix the problem, then ask the user before deleting
-  and re-pushing the tag (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`).
-- **Failed after the PyPI upload succeeded** (for example the GitHub release
-  step): the version is live. Don't delete the tag. Fix the workflow, and
-  create the missing GitHub release by hand if the user wants it.
-- **A bad version reached PyPI:** PyPI never allows re-uploading the same
-  version. Fix forward with a new patch version. The user can "yank" the bad
-  one on pypi.org; don't try to delete it.
+- **Bad version pushed to main:** fix forward with a new patch version; don't
+  force-push `main`.
+- **Wrong tag:** ask the user before deleting and re-pushing it
+  (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`, and
+  `gh release delete vX.Y.Z -R thoitiettxl-cyber/muse-cli` if a release exists).
 
-### Don't change without the user's say-so
+### Don't
 
-PyPI trusts this repo through a trusted publisher tied to the workflow file
-name `publish.yml` and the GitHub environment `pypi`. Renaming either breaks
-publishing until the PyPI settings are updated to match.
+- Don't build for or upload to PyPI (`twine`, `uv publish`, publish
+  workflows), and don't add a PyPI install path back to `install.sh`,
+  `update.py`, the skill, or the README.
+- Don't add GitHub Actions workflows unless the user asks; there are no
+  minutes for them.
