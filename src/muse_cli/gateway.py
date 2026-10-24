@@ -74,6 +74,19 @@ def media_path(ref):
     return "/media/raw/" + urllib.parse.quote(rel, safe="/")
 
 
+def join_chunks(partial, ntf):
+    """Feed one NoiseTransportFrame; return the full payload once complete."""
+    total = ntf.total_chunks or 1
+    if total <= 1:
+        return bytes(ntf.payload)
+    parts = partial.setdefault(ntf.chunk_id, {})
+    parts[ntf.chunk_index] = bytes(ntf.payload)
+    if len(parts) < total:
+        return None
+    del partial[ntf.chunk_id]
+    return b"".join(parts[i] for i in sorted(parts))
+
+
 class GatewayError(RuntimeError):
     def __init__(self, status, payload):
         super().__init__(f"gateway status={status} payload={payload!r}")
@@ -355,6 +368,7 @@ class Gateway:
         self.stream = 1
         self._send_lock = threading.Lock()
         self._recv_lock = threading.Lock()
+        self._partial = {}  # chunk_id -> {chunk_index: payload}
 
     # -- low-level framing -------------------------------------------------
     def _send_envelope(self, service_id, frame_bytes):
@@ -370,13 +384,20 @@ class Gateway:
         # decrypt (which corrupts the transport state -> BAD_DECRYPT).
         # Callers must still avoid *logical* races: only one thread should
         # be consuming frames at a time, or responses get misrouted.
+        # A large response (e.g. /approvals with many recent entries) arrives
+        # as several transport frames sharing a chunk_id; join them in
+        # chunk_index order before parsing the ServiceResponse.
         with self._recv_lock:
-            data, _flags = self.ws.recv()
-            pt = bytes(self.noise.decrypt(bytes(data)))
-        ntf = NoiseTransportFrame()
-        ntf.ParseFromString(pt)
+            while True:
+                data, _flags = self.ws.recv()
+                pt = bytes(self.noise.decrypt(bytes(data)))
+                ntf = NoiseTransportFrame()
+                ntf.ParseFromString(pt)
+                payload = join_chunks(self._partial, ntf)
+                if payload is not None:
+                    break
         sr = ServiceResponse()
-        sr.ParseFromString(ntf.payload)
+        sr.ParseFromString(payload)
         sf = ServiceFrame()
         sf.ParseFromString(sr.payload)
         return sf
