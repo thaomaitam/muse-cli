@@ -5,7 +5,16 @@ set -u
 
 REPO_URL="${MUSE_CLI_REPO:-https://github.com/nikships/muse-cli.git}"
 RAW_URL="${MUSE_CLI_RAW:-https://raw.githubusercontent.com/nikships/muse-cli/main}"
-SKILL_DIR="${MUSE_CLI_SKILLS:-$HOME/.agents/skills}"
+# Skill target: MUSE_CLI_SKILLS wins; on a Grok Bot box use the shared skill
+# folder every assistant can read; otherwise the generic agents path.
+GROKBOT_WORKFLOWS="/home/box/agent-data/workflows"
+if [ -n "${MUSE_CLI_SKILLS:-}" ]; then
+  SKILL_DIR="$MUSE_CLI_SKILLS"
+elif [ -d "$GROKBOT_WORKFLOWS" ]; then
+  SKILL_DIR="/home/box/skill-assets"
+else
+  SKILL_DIR="$HOME/.agents/skills"
+fi
 BIN_NAME="muse-cli"   # 'muse' clashes with Muse Code, don't use it
 LEGACY_BIN="${MUSE_CLI_BIN:-$HOME/bin}/$BIN_NAME"
 
@@ -37,6 +46,11 @@ mkdir -p "$SKILL_DIR/muse-cli"
 curl -fsSL "$RAW_URL/skills/muse-cli/SKILL.md" -o "$SKILL_DIR/muse-cli/SKILL.md" \
   || fail "skill download failed"
 echo "skill installed at $SKILL_DIR/muse-cli"
+if [ -z "${MUSE_CLI_SKILLS:-}" ] && [ -d "$GROKBOT_WORKFLOWS" ]; then
+  echo "Grok Bot box: skills are registered by an assistant, not by copying files."
+  echo "  Ask your assistant to register (or refresh) the muse-cli skill from"
+  echo "  $SKILL_DIR/muse-cli/SKILL.md; it then loads for every assistant."
+fi
 
 BIN_DIR="$(uv tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
 # uv prints the bin dir with a literal ".." inside; normalize it so the PATH
