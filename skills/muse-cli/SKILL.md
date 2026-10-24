@@ -20,8 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/nikships/muse-cli/main/install.sh |
 ```
 
 This installs the CLI from PyPI with `uv tool install muse-cli` (its own
-isolated environment) and this skill (to `~/.agents/skills/muse-cli`). CLI
-only? `uv tool install muse-cli`, `pipx install muse-cli`, or
+isolated environment) and this skill (to `~/.agents/skills/muse-cli`; on a
+Grok Bot box to `/home/box/skill-assets/muse-cli`; `MUSE_CLI_SKILLS`
+overrides). CLI only? `uv tool install muse-cli`, `pipx install muse-cli`, or
 `pip install muse-cli` all work. The command is `muse-cli` (`muse` clashes
 with Muse Code, don't use it). Verify before continuing:
 
