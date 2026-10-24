@@ -25,16 +25,45 @@
   connection before that (no raw fire-and-forget).
 - Exit codes of `wait` and `send --wait/--until-done`:
   `0` turn done (final replies printed) · `2` task failed/cancelled ·
-  `4` needs a human: a pending approval (`muse-cli approvals`, then
-  `muse-cli approve ID --once|--session|--today|--always` or `muse-cli deny ID`;
-  ask the user first) or a question in the final reply (widget or plain text,
-  printed) · `124` timeout (run `wait` again).
+  `4` needs a human: a question in the final reply (widget or plain text,
+  printed), or a pending approval when auto-approve is off or could not
+  decide it (`muse-cli approvals`, then `muse-cli approve ID --always` or
+  `muse-cli deny ID`; ask the user first) · `124` timeout (run `wait` again).
 - After every `wait`/`send` read the final reply text (`final_text` in JSON,
   or the printed reply), not just the exit code. Outcomes: `done`,
   `needs_input` (Muse asked you something in plain text, a widget, a
   non-empty gate/policy question, or stopped on a safety check; `question`
   holds it), `needs_approval`, `failed`, `timeout`. `send --text` prints the
   reply as plain text instead of JSON.
+
+
+## Approvals and auto-approve
+
+Muse's approval prompt (e.g. `network_access` to `uploads.github.com`) has
+three choices: Allow once (`allow_once`), Always allow this site
+(`allow_always`, the "forever" choice) and Deny (`deny`). `approve --always`
+sends `allow_always`.
+
+Auto-approve makes `wait` and `send --wait/--until-done` decide every pending
+approval with `allow_always` (never once/session/today) and keep waiting for
+the turn instead of exiting 4. Each one is logged on stderr
+(`auto-approved ID (allow_always): ...`) and listed in the JSON result as
+`auto_approved` (`approval_id`, `title`, `kind`, `scope`, `decision`).
+Questions (`needs_input`) still exit 4: they can't be auto-answered. An
+approval without a forever option, or a failed decide, is reported in
+`auto_approve_errors` and still exits 4 with `needs_approval`.
+
+```bash
+muse-cli auto-approve status   # {"auto_approve": "always"|"off", "source": ...}
+muse-cli auto-approve on       # persistent: ~/.config/muse-cli/config.json
+muse-cli auto-approve off
+MUSE_AUTO_APPROVE=always|off   # env override for one shell/process
+muse-cli wait ... --auto-approve | --no-auto-approve   # per call (send too)
+muse-cli approve --all --always   # approve everything pending now, forever
+muse-cli approvals --approve-all  # same
+```
+
+Precedence: flag, then `MUSE_AUTO_APPROVE`, then the config. Default is off.
 
 ## Cutting a release
 

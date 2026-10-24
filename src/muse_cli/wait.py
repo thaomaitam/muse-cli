@@ -70,7 +70,21 @@ def describe_approval(a):
             "kind": q.get("kind") or (a.get("payload") or {}).get("type"),
             "scope": q.get("scope") or rows.get("Host"),
             "why": d.get("short_explanation") or d.get("reason") or a.get("reason"),
-            "expires_at_ms": a.get("request_expires_at_ms")}
+            "expires_at_ms": a.get("request_expires_at_ms"),
+            # The choices Muse offers in the app, e.g. allow_once ("Allow
+            # once"), allow_always ("Always allow this site" = forever), deny.
+            "options": [o.get("kind") for o in a.get("decision_options") or []
+                        if isinstance(o, dict) and o.get("kind")] or None}
+
+
+FOREVER = "allow_always"  # Muse's "forever" / "Always allow" choice
+
+
+def offers_forever(described):
+    """True when the approval can be decided with Muse's forever choice.
+    Approvals that list no options (older servers) are assumed to accept it."""
+    opts = described.get("options")
+    return not opts or FOREVER in opts
 
 
 def open_widgets(ev):
@@ -97,10 +111,17 @@ class Waiter:
 
     require_running: ignore terminal statuses until a `running` one is seen
     (used right after sending, when the replayed status is stale).
+    approver: optional callable(list of describe_approval dicts) that decides
+    new pending approvals (auto-approve) and returns the ids it handled.
+    Handled approvals do not stop the wait; anything it could not handle
+    still ends it with ("approval", ...). Each id is offered once.
     """
-    def __init__(self, thread=None, require_running=False):
+    def __init__(self, thread=None, require_running=False, approver=None):
         self.thread = thread
         self.require_running = require_running
+        self.approver = approver
+        self.handled = set()    # approval ids the approver already decided
+        self.offered = set()    # approval ids already passed to the approver
         self.seen_running = False
         self.result = None      # ("done"|"failed"|"approval", detail)
         self.status = None
@@ -113,7 +134,17 @@ class Waiter:
                 return None
         pend = pending_approvals(ev)
         if pend:
-            self.result = ("approval", [describe_approval(a) for a in pend])
+            described = [describe_approval(a) for a in pend]
+            if self.approver:
+                new = [d for d in described if d["approval_id"] not in self.offered]
+                if new:
+                    self.offered.update(d["approval_id"] for d in new)
+                    self.handled.update(self.approver(new) or ())
+                left = [d for d in described if d["approval_id"] not in self.handled]
+                if not left:
+                    return None  # all auto-approved; keep waiting for the turn
+                described = left
+            self.result = ("approval", described)
             return self.result
         s = task_status(ev, self.thread)
         if s:

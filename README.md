@@ -167,7 +167,9 @@ muse-cli history --thread <session-id> --limit 5  # one side chat
 muse-cli send "summarize my unread" --wait 120    # send, wait until the turn is done (max 120s)
 muse-cli send "do X" --until-done                # block until done; exits 0/2/4/124
 muse-cli wait --after-seq N [--thread ID]         # block until the turn ends (no polling)
-muse-cli approvals ; muse-cli approve ID --session ; muse-cli deny ID
+muse-cli approvals ; muse-cli approve ID --always ; muse-cli deny ID
+muse-cli approve --all --always                   # approve everything pending, forever
+muse-cli auto-approve on|off|status               # wait/send approve approvals forever and keep going
 muse-cli watch --timeout 60                       # tail live agent events
 muse-cli usage                                    # plan: weekly limit % used, reset, bonus tokens
 muse-cli invite                                   # invite code, uses left, rewards (--json/--raw; --create makes one)
@@ -218,7 +220,7 @@ Pipe it into other tools:
 muse-cli send "what's on my calendar today?" | jq -r .reply.text
 ```
 
-Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer (incl. a plain-text question in the final reply), 124 timeout; always read `final_text`; `send` exits 5 if delivery is not acked.
+Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer (incl. a plain-text question in the final reply; with `muse-cli auto-approve on`, `MUSE_AUTO_APPROVE=always` or `--auto-approve`, approvals are decided with `allow_always`, Muse's "Always allow" choice, listed in `auto_approved`, and the wait goes on), 124 timeout; always read `final_text`; `send` exits 5 if delivery is not acked.
 
 ## How it works
 

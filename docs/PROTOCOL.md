@@ -34,6 +34,9 @@ chat / feed / goals / ideas / sessions / ...
   exists in the client for other configurations.
 - **Framing:** `NoiseTransportFrame{chunk_id(i64), chunk_index, total_chunks,
   payload}` protobuf → Noise transport encrypt → one WS binary frame each.
+  Large responses (e.g. `/approvals` with many recent entries) are split
+  across several frames sharing a `chunk_id`; join payloads in `chunk_index`
+  order once `total_chunks` have arrived, then parse the `ServiceResponse`.
 - **Request:** `ServiceRequest{service, payload =
   ServiceFrame{stream_id, request =
   ApplicationRequest{verb, path, headers, body, end_body}}}`. Stream ids start
@@ -151,7 +154,11 @@ Live `chat.subscribe` replays current state on connect, then streams:
 - `approvals.snapshot` payload `{emitted_at_ms, pending_approvals[], recent_approvals[]}`;
   each approval has `approval_id`, `display.{summary_title, short_explanation,
   permission_question{kind,scope,text}, detail_rows}`, `payload.network_payload`,
-  `request_expires_at_ms`, and once decided `decision`.
+  `request_expires_at_ms`, and once decided `decision`. Pending ones carry
+  `decision_options[{kind, label, label_text}]`, the app's buttons:
+  `allow_once` "Allow once", `allow_always` "Always allow this site"
+  (the forever choice; recent entries then show `always_scope: destination`,
+  outcome "Site always allowed"), `deny` "Deny".
 - Widgets: assistant messages embed `[[hatch_widget:<id>]]` in text and carry
   `payload.widgets[{widget_id, kind:"option", data.options, display_text, state}]`.
 
