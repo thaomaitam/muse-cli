@@ -1689,3 +1689,37 @@ def test_live_image_last_removes_the_empty_trailing_bubble(env):
     assert len(env.tg.sent("deleteMessage")) == 1     # the status bubble opened after the photo
     finals = [p["text"] for p in env.tg.sent("editMessageText") if " · " not in p["text"]]
     assert finals == ["Đây là ảnh."]
+
+
+def test_curl_sessions_are_never_shared_between_threads(monkeypatch):
+    """0.5.6 regression: one curl_cffi Session shared by the poller and other
+    threads hung Telegram calls; each thread must get its own session, and a
+    created session must not bypass the warm pool."""
+    import threading as _th
+    import types
+    from muse_cli.tgapi import TelegramAPI
+    made = []
+
+    class FakeSession:
+        def __init__(self):
+            made.append(_th.current_thread().name)
+
+        def post(self, url, timeout=None, **kw):
+            return types.SimpleNamespace(json=lambda: {"ok": True, "result": True}, status_code=200)
+
+    import curl_cffi.requests as rq
+    monkeypatch.setattr(rq, "Session", FakeSession)
+    api = TelegramAPI(TOKEN)
+    api.call("getUpdates")                       # main thread: its own session
+    seen = []
+    orig = api._post_now
+
+    def spy(method, timeout, **kw):
+        seen.append(_th.current_thread().name)
+        return orig(method, timeout, **kw)
+    monkeypatch.setattr(api, "_post_now", spy)
+    t = _th.Thread(target=api.call, args=("sendMessage",), kwargs={"chat_id": 1, "text": "x"})
+    t.start()
+    t.join()
+    assert seen and seen[0].startswith("tg-http")            # still routed to the pool
+    assert len(made) == 2 and made[0] != made[1]             # distinct per-thread sessions

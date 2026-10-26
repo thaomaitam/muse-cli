@@ -50,7 +50,8 @@ class TelegramAPI:
             raise ValueError("that does not look like a bot token (expected 123456:ABC...)")
         self.token = token.strip()
         self.base = base
-        self._session = session
+        self._injected = session          # tests inject a fake session
+        self._local = threading.local()   # real calls: one curl session per thread
         # All Bot API calls run on a few long-lived threads: curl_cffi keeps
         # one curl handle (with its warm TLS connection) per thread, so a call
         # from a fresh worker thread would otherwise pay a new TLS handshake
@@ -66,13 +67,20 @@ class TelegramAPI:
         return str(text).replace(self.token, "<token>")
 
     def _http(self):
-        if self._session is None:
+        # A curl_cffi Session is NOT thread-safe: sharing one across the
+        # poller, the status-edit ticker and turn threads hung every call
+        # (0.5.6: getUpdates and editMessageText stuck in curl perform for
+        # minutes). Each thread gets its own session (and warm connection).
+        if self._injected is not None:
+            return self._injected
+        sess = getattr(self._local, "session", None)
+        if sess is None:
             from curl_cffi import requests as rq
-            self._session = rq.Session()
-        return self._session
+            sess = self._local.session = rq.Session()
+        return sess
 
     def _post(self, method, timeout, **kw):
-        if self._session is not None or method == "getUpdates" or \
+        if self._injected is not None or method == "getUpdates" or \
                 threading.current_thread().ident in self._pool_threads:
             return self._post_now(method, timeout, **kw)
         with self._pool_lock:
