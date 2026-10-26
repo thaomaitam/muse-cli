@@ -1044,9 +1044,38 @@ def make_auto_approver(cfg, approved, errors, connector=None):
     return approve
 
 
+def task_state(gw, thread=None, timeout=6):
+    """Muse's current task status for the main chat or THREAD, as the server
+    replays it on chat.subscribe (e.g. "running", "completed"), or None."""
+    from .wait import task_status
+    found = []
+
+    def on_record(line):
+        try:
+            ev = json.loads(line)
+        except (ValueError, TypeError):
+            return False
+        s = task_status(ev, thread)
+        if s:
+            found.append(s)
+            return True
+        return False
+    body = {"capabilities": ["chat_cancel", "delta_stream"]}
+    if thread:
+        body["session_id"] = thread
+    gw.subscribe_raw("chat.subscribe", body=body, max_records=50, idle_timeout=timeout,
+                     overall_timeout=timeout, on_record=on_record)
+    return found[0] if found else None
+
+
+RECHECK_AFTER = 30      # seconds without any live record before re-checking the server
+ONLINE_GRACE = 3        # Muse said "online" (idle) but no turn end followed within this
+RESUB_PAUSE = 1.0       # pause before re-subscribing after a stream ended
+
+
 def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
              on_event=None, auto_approve=None, connector=None, approver=None,
-             should_stop=None):
+             should_stop=None, recheck=None, recheck_after=None, log=None):
     """Subscribe until the turn ends, a human is needed, or timeout.
 
     auto_approve: True/False per call, None to use MUSE_AUTO_APPROVE or the
@@ -1056,38 +1085,138 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     the built-in auto-approver when auto-approve is on. should_stop: callable
     polled every couple of seconds; True ends the wait early (outcome timeout).
 
+    Turn-end detection never trusts one subscription alone:
+    - a terminal status replayed before our turn was seen running is checked
+      against chat.history (a reply after after_seq means the turn already
+      ran and ended, e.g. a fast answer that finished before we subscribed);
+    - when no record arrives for recheck_after seconds (watchdog), or the
+      stream ends, or recheck() returns True, the subscription is reopened
+      on a fresh connection: the server replays the current task.status, so
+      the state is re-read from the server instead of waiting forever.
+
     Returns (exit_code, result). The final replies are re-read from
     chat.history on a fresh connection (the subscription's reader thread
     still owns the old one).
     """
-    from .wait import Waiter, replies_after, exit_code, outcome_of, needs_input_reason, question_of
+    from .wait import (Waiter, replies_after, exit_code, outcome_of, needs_input_reason,
+                       question_of, in_scope)
+    import logging
+    log = log or logging.getLogger("muse_cli.wait")
     scope = {"session_id": thread} if thread else {}
     enabled, _src = auto_approve_setting(cfg, auto_approve)
     approved, approve_errors = [], []
     conn = connector or connect
+    recheck_after = RECHECK_AFTER if recheck_after is None else recheck_after
     if enabled:
         approver = approver or make_auto_approver(cfg, approved, approve_errors, connector=conn)
     else:
         approver = None
-    gw = conn(cfg)
-    try:
-        if after_seq is None:
+
+    def history_replies(limit=30):
+        g = conn(cfg)
+        try:
+            return replies_after(g.call_json("chat.history", body={"limit": limit, **scope})
+                                 .get("chat_events", []), after_seq)
+        finally:
+            g.close()
+
+    if after_seq is None:
+        gw = conn(cfg)
+        try:
             h = gw.call_json("chat.history", body={"limit": 1, **scope})
             evs = h.get("chat_events", [])
             after_seq = max((e.get("seq") or 0 for e in evs), default=0)
             # A plain `wait` after the last message: anything newer counts.
-        w = Waiter(thread=thread, require_running=require_running, approver=approver)
-        body = {"capabilities": ["chat_cancel", "delta_stream"], **scope}
+        finally:
+            gw.close()
+    w = Waiter(thread=thread, require_running=require_running, approver=approver)
+    body = {"capabilities": ["chat_cancel", "delta_stream"], **scope}
+    deadline = time.time() + timeout
+    user_stop = should_stop or (lambda: False)
+    forced = [False]
+    last_record = [time.time()]
+    online_at = [0.0]          # when Muse said "online" (idle) mid-turn
 
-        def on_record(line):
-            if on_event:
-                on_event(line)
-            return w.feed(line) is not None
-        kw = {"should_stop": should_stop} if should_stop else {}
-        gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9,
-                         idle_timeout=timeout, overall_timeout=timeout, on_record=on_record, **kw)
-    finally:
-        gw.close()
+    def stop_now():
+        if user_stop():
+            return True
+        if (recheck and recheck()) or (recheck_after and time.time() - last_record[0] > recheck_after):
+            forced[0] = True
+            return True
+        if online_at[0] and time.time() - online_at[0] > ONLINE_GRACE:
+            # Muse went idle but no terminal task.status followed: re-read the
+            # state from the server instead of trusting this stream.
+            log.info("Muse is online (idle) with no turn end on the stream; re-checking")
+            online_at[0] = 0.0
+            forced[0] = True
+            return True
+        return False
+
+    def on_record(line):
+        if on_event:
+            on_event(line)
+        if w.feed(line) is not None:
+            return True
+        try:
+            ev = json.loads(line)
+        except (ValueError, TypeError):
+            ev = {}
+        name = str(ev.get("event") or ev.get("event_name") or "") if isinstance(ev, dict) else ""
+        if name.startswith(("delta.", "task.", "agent.", "message.")):
+            last_record[0] = time.time()   # progress; keep-alives do not count
+        p = ev.get("payload") if isinstance(ev, dict) and isinstance(ev.get("payload"), dict) else {}
+        if (name == "agent.status" and p.get("activity_code") == "online" and w.seen_running
+                and in_scope(ev, thread)):
+            # Muse went idle but no terminal task.status came with it (yet):
+            # re-read the state from the server instead of trusting the stream.
+            if not online_at[0]:
+                online_at[0] = time.time()
+        elif name in ("delta.text_append", "delta.message_start") or (
+                name == "agent.status" and p.get("activity_code") not in (None, "online")):
+            online_at[0] = 0.0
+        if w.ignored_terminal:
+            try:
+                replies = history_replies()
+            except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+                log.debug("history check failed: %s", e)
+                return False
+            if w.settle(replies) is not None:
+                log.info("turn already over (status %s, %d reply(s) after seq %s)",
+                         w.status, len(replies), after_seq)
+                return True
+        return False
+
+    attempt, failures = 0, 0
+    while w.result is None and time.time() < deadline and not user_stop():
+        if attempt:
+            time.sleep(min(RESUB_PAUSE * (2 ** min(failures, 5)), 30) if failures else RESUB_PAUSE)
+            if w.result is not None or user_stop() or time.time() >= deadline:
+                break
+        attempt += 1
+        forced[0] = False
+        online_at[0] = 0.0
+        last_record[0] = time.time()
+        left = max(1, deadline - time.time())
+        idle = min(left, recheck_after) if recheck_after else left
+        try:
+            gw = conn(cfg)
+        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+            failures += 1
+            log.warning("wait: connect failed (%s); retrying", e)
+            continue
+        try:
+            gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9,
+                             idle_timeout=idle, overall_timeout=left, on_record=on_record,
+                             should_stop=stop_now)
+            failures = 0
+        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+            failures += 1
+            log.warning("wait: subscription failed (%s); retrying", e)
+        finally:
+            gw.close()
+        if w.result is None and not user_stop() and time.time() < deadline:
+            log.debug("wait: re-checking the server (%s; status %s)",
+                      "requested" if forced[0] else "no events / stream ended", w.status)
     kind, detail = w.result or ("timeout", w.status)
     replies = []
     gw = conn(cfg)

@@ -125,6 +125,11 @@ class Waiter:
         self.seen_running = False
         self.result = None      # ("done"|"failed"|"approval", detail)
         self.status = None
+        # A terminal status ignored because no `running` was seen yet. It is
+        # stale when the turn has not started, but it is also what a turn
+        # that finished before we subscribed looks like (fast replies): the
+        # caller settles that with chat.history (see settle()).
+        self.ignored_terminal = None
 
     def feed(self, ev):
         if isinstance(ev, (bytes, str)):
@@ -151,11 +156,23 @@ class Waiter:
             self.status = s
             if s in DONE or s in FAILED:
                 if self.require_running and not self.seen_running:
+                    self.ignored_terminal = s
                     return None
                 self.result = ("done" if s in DONE else "failed", s)
                 return self.result
             self.seen_running = True
+            self.ignored_terminal = None
         return None
+
+    def settle(self, replies):
+        """Accept the ignored terminal status when chat.history already holds
+        a reply to our message: the turn ran and ended before the
+        subscription started. Returns the result or None."""
+        s = self.ignored_terminal
+        self.ignored_terminal = None
+        if self.result is None and s and replies:
+            self.result = ("done" if s in DONE else "failed", s)
+        return self.result if s and replies else None
 
 
 def replies_after(events, after_seq):

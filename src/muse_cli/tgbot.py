@@ -53,6 +53,8 @@ WATCH_FLUSH = 3.0            # /watch batches events at most this often
 CHATS_PAGE = 8
 MAX_FILES_PER_TURN = 6
 MAIN = "main"                # state key for the main chat (session_id None)
+WATCHDOG = 20                # a turn with no live record this long is re-checked on the server
+QUEUE_RECHECK = 8            # a new message waits this long for a re-checked turn to end
 
 COMMANDS = [
     ("help", "what the bot can do"),
@@ -270,6 +272,8 @@ def watch_line(ev):
         detail = p.get("display_text") or p.get("summary") or p.get("activity_text") or ""
         return f"🔧 {_tool_name(p) or 'tool'}" + (f": {str(detail)[:120]}" if detail else "")
     if name == "agent.status":
+        if p.get("activity_code") == "online":
+            return "⏳ Muse is wrapping up…"     # idle; the turn end is being confirmed
         t = p.get("activity_text") or p.get("status_text") or p.get("text")
         return f"⏳ {_activity(t)[:160]}" if t else None
     if name == "task.status":
@@ -296,9 +300,17 @@ def status_from_event(ev):
         tool = _tool_name(p)
         return f"🔧 {tool}" if tool else "🔧 using a tool"
     if name == "agent.status":
+        if p.get("activity_code") == "online":
+            return "⏳ Muse is wrapping up…"     # idle; the turn end is being confirmed
         t = p.get("activity_text") or p.get("status_text")
         return f"⏳ {_activity(t)[:120]}" if t else None
     return None
+
+
+def short(text, n=24):
+    """A short prefix of a message for logs (never the whole content)."""
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[:n] + "…"
 
 
 def _strip_tags(text):
@@ -327,7 +339,15 @@ class Turn:
         self.cancel_requested = False
         self.stop_waiting = False
         self.finished = False
+        self.recheck_requested = False
         self.lock = threading.Lock()
+
+    def take_recheck(self):
+        """run_wait polls this: True once after someone asked to re-check the server."""
+        if self.recheck_requested:
+            self.recheck_requested = False
+            return True
+        return False
 
     def on_event(self, line):
         """Live chat.subscribe record (subscription thread)."""
@@ -343,6 +363,11 @@ class Turn:
                 self.parts[key] = self.parts.get(key, "") + str(p.get("text") or "")
                 self.last_delta = self.bot.clock()
                 self.dirty = True
+            elif name == "delta.message_start":
+                # a re-subscription may restart the stream of a message: start it over
+                key = str(p.get("message_id") or p.get("message_seq") or "m")
+                if key in self.parts:
+                    self.parts[key] = ""
             elif name == "delta.message_done":
                 key = str(p.get("message_id") or p.get("message_seq") or "m")
                 full = p.get("content") or p.get("display_text") or p.get("text")
@@ -693,17 +718,26 @@ class Bot:
             self.send(chat_id, f"⚠️ {esc(str(e)[:600])}")
 
     # -- turns ------------------------------------------------------------------
+    def active_turn(self, chat_id):
+        t = self.turns.get(chat_id)
+        return t if t is not None and not t.finished else None
+
     def enqueue(self, chat_id, job):
         """Messages to Muse run one at a time per Telegram chat, in order."""
         with self.lock:
-            busy = chat_id in self.turns or bool(self.queues[chat_id]) or chat_id in self.workers
+            turn = self.active_turn(chat_id)
+            ahead = len(self.queues[chat_id])
             self.queues[chat_id].append(job)
             start = chat_id not in self.workers
             if start:
                 self.workers[chat_id] = None
-        if busy and job[0] == "text":
-            self.send(chat_id, "⏳ Queued: Muse is still on your previous message. /stop cancels it.",
-                      silent=True)
+        log.info("queue chat=%s job=%s ahead=%d turn_active=%s", chat_id, job[0], ahead,
+                 turn is not None)
+        if job[0] == "text" and (turn is not None or ahead):
+            # Do not trust local state alone: ask the turn to re-check the
+            # server; if Muse is actually idle the turn ends and this message
+            # goes out right away without a "Queued" notice.
+            self.background(self._queued_notice, chat_id, turn, ahead)
         if not start:
             return
         if self.sync:
@@ -714,6 +748,22 @@ class Bot:
             self.workers[chat_id] = t
         t.start()
 
+    def _queued_notice(self, chat_id, turn, ahead):
+        if turn is not None and not ahead:
+            turn.recheck_requested = True
+            end = time.time() + QUEUE_RECHECK
+            while not turn.finished and time.time() < end:
+                time.sleep(0.25)
+            if turn.finished:
+                log.info("queue chat=%s: previous turn was over on re-check; sending now", chat_id)
+                return
+            log.info("queue chat=%s: Muse still running after re-check; message queued", chat_id)
+        with self.lock:
+            still_queued = bool(self.queues[chat_id])
+        if still_queued:
+            self.send(chat_id, "⏳ Queued: Muse is still on your previous message. /stop cancels it.",
+                      silent=True)
+
     def _drain(self, chat_id):
         while True:
             with self.lock:
@@ -721,6 +771,7 @@ class Bot:
                     self.workers.pop(chat_id, None)
                     return
                 job = self.queues[chat_id].popleft()
+            log.info("dequeue chat=%s job=%s left=%d", chat_id, job[0], len(self.queues[chat_id]))
             try:
                 if job[0] == "text":
                     self.run_turn(chat_id, job[1])
@@ -733,6 +784,8 @@ class Bot:
         cs = dict(self.chat_state(chat_id))
         turn = Turn(self, chat_id, cs["session_id"], cs["title"])
         self.turns[chat_id] = turn
+        log.info("turn start chat=%s session=%s text=%r", chat_id, turn.session_id or MAIN,
+                 short(text))
         try:
             turn.msg_id = self.api.call("sendMessage", chat_id=chat_id,
                                         text="⏳ Sending to Muse…")["message_id"]
@@ -741,7 +794,9 @@ class Bot:
             ticker = None
             try:
                 user_seq, _sid = cli.deliver(gw, cfg, text, turn.session_id)
+                log.info("turn delivered chat=%s seq=%s", chat_id, user_seq)
                 if user_seq is None:
+                    log.warning("turn chat=%s: no delivery ack", chat_id)
                     self.edit(chat_id, turn.msg_id, "⚠️ Muse did not confirm delivery within 30 s. "
                               "Check /history before sending again.", html=False)
                     return
@@ -771,6 +826,7 @@ class Bot:
         turn = Turn(self, chat_id, session_id, title)
         turn.user_seq = after_seq
         self.turns[chat_id] = turn
+        log.info("turn resume chat=%s session=%s after_seq=%s", chat_id, session_id or MAIN, after_seq)
         try:
             turn.msg_id = self.api.call("sendMessage", chat_id=chat_id,
                                         text="⏳ Muse is continuing…")["message_id"]
@@ -821,8 +877,13 @@ class Bot:
         _code, res = cli.run_wait(
             cfg, turn.session_id, after_seq, TURN_TIMEOUT, require_running=require_running,
             on_event=turn.on_event, auto_approve=self.auto_approve, connector=self.muse.connect,
-            approver=self.approve_forever, should_stop=turn.should_stop)
+            approver=self.approve_forever, should_stop=turn.should_stop,
+            recheck=turn.take_recheck, recheck_after=WATCHDOG, log=log)
         turn.finished = True
+        log.info("turn end chat=%s session=%s outcome=%s status=%s secs=%.0f replies=%d%s",
+                 turn.chat_id, turn.session_id or MAIN, res.get("outcome"), res.get("status"),
+                 self.clock() - turn.started, len(res.get("replies") or []),
+                 " (stop requested)" if turn.cancel_requested else "")
         self.finish_turn(turn, res)
 
     def finish_turn(self, turn, res):
@@ -990,7 +1051,7 @@ class Bot:
                               reply_markup=keyboard([]))
             except Exception:  # noqa: BLE001
                 pass
-        if after_seq is not None and chat_id not in self.turns:
+        if after_seq is not None and self.active_turn(chat_id) is None:
             self.enqueue(chat_id, ("resume", session_id, title, after_seq))
 
     def cb_approve_all(self, chat_id, mid):
@@ -1061,7 +1122,7 @@ class Bot:
 
     def cmd_stop(self, chat_id, arg, **_):
         cs = self.chat_state(chat_id)
-        turn = self.turns.get(chat_id)
+        turn = self.active_turn(chat_id)
         sid = turn.session_id if turn else cs["session_id"]
         with self.muse.gw() as g:
             r = cli.cancel_turn(g, sid)
@@ -1069,8 +1130,10 @@ class Bot:
         with self.lock:
             dropped = len(self.queues[chat_id])
             self.queues[chat_id].clear()
+        log.info("stop chat=%s session=%s cancelled=%s dropped=%d", chat_id, sid or MAIN, cancelled, dropped)
         if turn:
             turn.cancel_requested = True
+            turn.recheck_requested = True
             turn.status = "⏹ stopping…"
             turn.dirty = True
             # The turn ends on Muse's cancelled status; stop following it after
@@ -1088,9 +1151,14 @@ class Bot:
         cs = self.chat_state(chat_id)
         with self.muse.gw() as g:
             st = cli.status_data(g)
+        try:
+            with self.muse.gw() as g:
+                server = cli.task_state(g, cs["session_id"]) or "unknown"
+        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+            server = f"unknown ({str(e)[:80]})"
         ident = st.get("identity") if isinstance(st.get("identity"), dict) else {}
         name = ident.get("name") or ident.get("display_name") or ident.get("assistant_name")
-        turn = self.turns.get(chat_id)
+        turn = self.active_turn(chat_id)
         here = esc(cs["title"]) + (f" (<code>{esc(cs['session_id'])}</code>)" if cs["session_id"] else "")
         now = (f"{esc(turn.status)} · {fmt_secs(self.clock() - turn.started)}" if turn
                else "idle (no turn from this chat)")
@@ -1099,6 +1167,7 @@ class Bot:
                  f"Unread: <code>{esc(json.dumps(st.get('unread'), ensure_ascii=False)[:200])}</code>",
                  f"Here: {here}",
                  f"Now: {now}",
+                 f"Muse task here (server): <code>{esc(server)}</code>",
                  f"Profile: <code>{esc(self.profile)}</code> · auto-approve: "
                  f"{'on (always)' if self.auto_approve else 'off'} · watch: "
                  f"{'on' if self.state.get('watch') else 'off'}",

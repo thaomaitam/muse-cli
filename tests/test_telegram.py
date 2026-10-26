@@ -109,6 +109,8 @@ class Server:
         self.script = None           # callable(session_id) -> list of lines / callables
         self.idea_execs = []
         self.ops = []
+        self.subscribes = 0
+        self.idle_cap = 30           # how long an "IDLE" stream stays open at most
 
     def next_seq(self):
         self.seq += 1
@@ -204,7 +206,14 @@ class FakeGateway:
     def subscribe_raw(self, method, body=None, on_record=None, should_stop=None, **_kw):
         sid = (body or {}).get("session_id")
         script = (self.s.script or self.s.default_script)(sid)
+        self.s.subscribes += 1
         for item in script:
+            if item == "IDLE":     # the stream stays open but goes quiet
+                import time as _t
+                end = _t.time() + self.s.idle_cap
+                while _t.time() < end and not (should_stop and should_stop()):
+                    _t.sleep(0.01)
+                break
             if callable(item):
                 item()
                 continue
@@ -234,6 +243,8 @@ def home(tmp_path, monkeypatch):
     tgbot.write_private_json(tgbot.config_path(), {"token": TOKEN, "owner_id": OWNER,
                                                    "allowed_user_ids": [OWNER]})
     monkeypatch.setattr(cli, "POLL", 0)
+    monkeypatch.setattr(cli, "RESUB_PAUSE", 0, raising=False)
+    monkeypatch.setattr(tgbot, "QUEUE_RECHECK", 0.3, raising=False)
     return tmp_path
 
 
@@ -824,3 +835,304 @@ def test_pairing_rejects_groups_and_partial_codes():
     group = {"text": "/start 530029", "from": {"id": 7}, "chat": {"id": -1, "type": "group"}}
     partial = {"text": "/start 5300291", "from": {"id": 8}, "chat": {"id": 8, "type": "private"}}
     assert _pair_with([group, partial]) is None
+
+
+# -- turn-end detection (regressions: 0.5.1 "Queued" forever) ---------------------------------
+def _wait_env(home):
+    server = Server()
+    assert server.add(None, "message.user", "hi")["seq"] == 101
+    return server
+
+
+def test_run_wait_fast_turn_finished_before_subscribe(home):
+    """The reply landed and the task completed before we subscribed: the replay
+    shows only "completed". 0.5.1 ignored it (never saw running) and hung."""
+    import time as _t
+    server = _wait_env(home)
+    server.add(None, "message.assistant", "Hi Boss. What are we working on next?")
+    server.script = lambda sid: [ts("completed"), "IDLE"]
+    t0 = _t.time()
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False, recheck_after=60)
+    assert _t.time() - t0 < 2
+    assert res["outcome"] == "needs_input" and res["final_text"].startswith("Hi Boss")
+
+
+def test_run_wait_stale_completed_without_reply_keeps_waiting(home):
+    server = _wait_env(home)
+
+    def script(sid):
+        return [ts("completed"), ts("running"), lambda: server.add(None, "message.assistant", "done!"),
+                ts("completed")]
+    server.script = script
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False)
+    assert res["outcome"] == "done" and res["final_text"] == "done!" and server.subscribes == 1
+
+
+def test_run_wait_watchdog_rechecks_a_silent_stream(home):
+    """The completion event never arrives on the open subscription: after
+    recheck_after seconds of silence the server state is re-read."""
+    import time as _t
+    server = _wait_env(home)
+    calls = []
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            return [ts("running"), lambda: server.add(None, "message.assistant", "pong"), "IDLE"]
+        return [ts("completed")]
+    server.script = script
+    t0 = _t.time()
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False, recheck_after=0.2)
+    assert res["outcome"] == "done" and res["final_text"] == "pong"
+    assert len(calls) == 2 and _t.time() - t0 < 3
+
+
+def test_run_wait_resubscribes_when_stream_ends(home):
+    server = _wait_env(home)
+    calls = []
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            return [ts("running")]           # stream closed by the server mid-turn
+        return [ts("running"), lambda: server.add(None, "message.assistant", "ok"), ts("completed")]
+    server.script = script
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False)
+    assert res["outcome"] == "done" and len(calls) == 2
+
+
+def test_run_wait_survives_subscription_errors(home):
+    server = _wait_env(home)
+    calls = []
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("socket closed")
+        return [ts("running"), lambda: server.add(None, "message.assistant", "ok"), ts("completed")]
+    server.script = script
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False)
+    assert res["outcome"] == "done"
+
+
+def test_run_wait_recheck_hook(home):
+    """recheck() (the bot's queue self-heal) re-reads the server immediately."""
+    server = _wait_env(home)
+    calls, asked = [], [True]
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            return [ts("running"), lambda: server.add(None, "message.assistant", "x"), "IDLE"]
+        return [ts("completed")]
+    server.script = script
+
+    def recheck():
+        if asked and calls:
+            asked.pop()
+            return True
+        return False
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False, recheck=recheck, recheck_after=60)
+    assert res["outcome"] == "done" and len(calls) == 2
+
+
+def test_bot_fast_reply_turn_ends(env):
+    """Muse answered before the bot subscribed (main chat, short reply)."""
+    def script(sid):
+        if not any(e["event_name"] == "message.assistant" and e["seq"] > 101
+                   for e in env.s.events[sid]):
+            env.s.add(sid, "message.assistant", "Hi Boss. What are we working on next?")
+        return [ts("completed"), "IDLE"]
+    env.s.script = script
+    import time as _t
+    t0 = _t.time()
+    env.bot.handle_update(msg("hi"))
+    assert _t.time() - t0 < 3
+    final = env.tg.sent("editMessageText")[-1]["text"]
+    assert final.startswith("Hi Boss") and "online" not in final and "Still running" not in final
+    assert not env.bot.turns and not env.bot.workers
+
+
+def test_question_turn_then_followup_is_delivered(env):
+    """A turn that ends with a question is over: the next message is sent,
+    not queued, and its own turn ends."""
+    env.s.reply = "Boss muốn test foreground trước hay cài service luôn?"
+    env.bot.handle_update(msg("set it up"))
+    assert "Muse is asking" in env.tg.sent("editMessageText")[-1]["text"]
+    assert env.tg.buttons()
+    def fast(sid):    # the follow-up is answered before the bot subscribes
+        if env.s.events[sid][-1]["event_name"] == "message.user":
+            env.s.add(sid, "message.assistant", "Hi Boss.")
+        return [ts("completed"), "IDLE"]
+    env.s.script = fast
+    import time as _t
+    t0 = _t.time()
+    env.bot.handle_update(msg("hi"))
+    assert _t.time() - t0 < 3
+    assert [t for _s, t in env.s.sent_texts] == ["set it up", "hi"]
+    assert not any("Queued" in (t or "") for t in env.tg.texts())
+    assert env.tg.sent("editMessageText")[-1]["text"] == "Hi Boss."
+    assert not env.bot.turns
+
+
+def test_finished_turn_still_cleaning_up_does_not_say_queued(env):
+    """0.5.1 said "Queued" while the worker was still sending files of a turn
+    that had already ended."""
+    t = tgbot.Turn(env.bot, OWNER, None, "main chat")
+    t.finished = True
+    env.bot.turns[OWNER] = t
+    env.bot.workers[OWNER] = object()
+    env.bot.handle_update(msg("next"))
+    assert not any("Queued" in (x or "") for x in env.tg.texts())
+    assert list(env.bot.queues[OWNER]) == [("text", "next")]
+
+
+def test_queue_self_heals_when_server_says_idle(env):
+    """A turn the bot still thinks is running is asked to re-check the server;
+    when it ends, the new message goes out with no "Queued" notice."""
+    import threading
+    t = tgbot.Turn(env.bot, OWNER, None, "main chat")
+    env.bot.turns[OWNER] = t
+    env.bot.workers[OWNER] = object()
+
+    def fake_follow():                     # stands in for run_wait polling take_recheck()
+        while not t.take_recheck():
+            pass
+        t.finished = True
+    th = threading.Thread(target=fake_follow)
+    th.start()
+    env.bot.handle_update(msg("Bạn là models gì"))
+    th.join(2)
+    assert t.finished
+    assert not any("Queued" in (x or "") for x in env.tg.texts())
+
+
+def test_queue_notice_when_muse_really_busy(env):
+    t = tgbot.Turn(env.bot, OWNER, None, "main chat")
+    env.bot.turns[OWNER] = t
+    env.bot.workers[OWNER] = object()
+    env.bot.handle_update(msg("second"))
+    assert t.recheck_requested                   # it asked for a server re-check first
+    assert "Queued" in env.tg.sent()[-1]["text"]
+
+
+def test_threaded_stuck_turn_is_rescued_by_next_message(home, monkeypatch):
+    """End to end on the real threaded path: the live completion is missed, the
+    watchdog is far away, and the user's next message triggers the re-check;
+    both messages reach Muse and both turns end."""
+    import time as _t
+    monkeypatch.setattr(tgbot, "WATCHDOG", 120)
+    monkeypatch.setattr(tgbot, "QUEUE_RECHECK", 5)
+    server, tg = Server(), FakeTelegram()
+    first = []
+
+    def script(sid):
+        if not first:
+            first.append(1)
+            return [ts("running"), lambda: server.add(sid, "message.assistant", "Hi Boss."), "IDLE"]
+        if len(first) == 1 and server.sent_texts[-1][1] == "hi":
+            first.append(2)
+            return [ts("completed")]                 # the re-check: Muse is idle
+        return [ts("running"), lambda: server.add(sid, "message.assistant", "I am Muse."),
+                ts("completed")]
+    server.script = script
+    bot = tgbot.Bot(tg, muse=tgbot.Muse(connector=server.connect))
+    bot.edit_interval = 0
+    bot.ensure_monitors = lambda restart=False: None
+    bot.handle_update(msg("hi"))
+    deadline = _t.time() + 3
+    while _t.time() < deadline and not server.sent_texts:
+        _t.sleep(0.02)
+    _t.sleep(0.3)
+    bot.handle_update(msg("Bạn là models gì"))
+    deadline = _t.time() + 10
+    while _t.time() < deadline and (bot.turns or bot.workers or bot.queues[OWNER]):
+        _t.sleep(0.05)
+    bot.pool.shutdown(wait=True)
+    assert [t for _s, t in server.sent_texts] == ["hi", "Bạn là models gì"]
+    finals = [p["text"] for p in tg.sent("editMessageText") if "⏳" not in p["text"]]
+    assert "Hi Boss." in finals and "I am Muse." in finals
+    assert not any("Queued" in (x or "") for x in tg.texts())
+
+
+def test_turn_logging_is_useful_and_short(env, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="muse_cli.telegram")
+    secret = "a very long private message that should not be logged in full " * 3
+    env.bot.handle_update(msg(secret))
+    logs = caplog.text
+    assert "turn start" in logs and "turn end" in logs and "outcome=done" in logs
+    assert "queue chat=" in logs and "dequeue chat=" in logs
+    assert secret not in logs and secret[:24] in logs
+    assert TOKEN not in logs
+
+
+def test_status_shows_server_task_state(env):
+    env.s.script = lambda sid: [ts("completed")]
+    env.bot.handle_update(msg("/status"))
+    assert "completed" in env.tg.sent()[-1]["text"]
+
+
+def test_resubscribed_stream_does_not_duplicate_text(env):
+    t = tgbot.Turn(env.bot, OWNER, None, "main")
+    for _ in range(2):   # the same message streamed again after a re-subscription
+        t.on_event(json.dumps({"event": "delta.message_start", "payload": {"message_id": "a"}}))
+        t.on_event(json.dumps({"event": "delta.text_append", "payload": {"message_id": "a", "text": "Hi"}}))
+    assert t.parts["a"] == "Hi"
+
+
+def _online():
+    return json.dumps({"event": "agent.status", "payload": {"activity_code": "online",
+                                                             "activity_text": "online", "is_thread": False}})
+
+
+def test_run_wait_online_without_turn_end_rechecks_fast(home, monkeypatch):
+    """Muse said "online" (idle) but the stream never carried the completed status
+    (live case: the bot showed "⏳ online · 2m 41s")."""
+    import time as _t
+    monkeypatch.setattr(cli, "ONLINE_GRACE", 0.1)
+    server = _wait_env(home)
+    calls = []
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            return [ts("running"), lambda: server.add(None, "message.assistant", "OK"), _online(), "IDLE"]
+        return [_online(), ts("completed")]
+    server.script = script
+    t0 = _t.time()
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False, recheck_after=60)
+    assert res["outcome"] == "done" and res["final_text"] == "OK"
+    assert len(calls) == 2 and _t.time() - t0 < 3
+
+
+def test_keepalives_do_not_feed_the_watchdog(home):
+    import time as _t
+    server = _wait_env(home)
+    calls = []
+    ka = json.dumps({"event": "keepalive", "payload": {}})
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            return [ts("running"), lambda: server.add(None, "message.assistant", "x")] + \
+                [lambda: _t.sleep(0.02), ka] * 100 + ["IDLE"]
+        return [ts("completed")]
+    server.script = script
+    t0 = _t.time()
+    code, res = cli.run_wait({}, None, 101, 30, require_running=True, connector=server.connect,
+                             auto_approve=False, recheck_after=0.3)
+    assert res["outcome"] == "done" and len(calls) == 2
+    assert _t.time() - t0 < 1.5        # 100 keep-alives (2 s) did not hold off the watchdog
+
+
+def test_online_status_label():
+    ev_ = json.loads(_online())
+    assert tgbot.status_from_event(ev_) == "⏳ Muse is wrapping up…"
