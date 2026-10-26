@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import threading
 import time
 import uuid
 
@@ -50,6 +51,13 @@ class TelegramAPI:
         self.token = token.strip()
         self.base = base
         self._session = session
+        # All Bot API calls run on a few long-lived threads: curl_cffi keeps
+        # one curl handle (with its warm TLS connection) per thread, so a call
+        # from a fresh worker thread would otherwise pay a new TLS handshake
+        # (measured 0.3-1.6 s vs ~0.1 s on a warm connection).
+        self._pool = None
+        self._pool_lock = threading.Lock()
+        self._pool_threads = set()
 
     def __repr__(self):
         return "TelegramAPI(token=<redacted>)"
@@ -64,6 +72,20 @@ class TelegramAPI:
         return self._session
 
     def _post(self, method, timeout, **kw):
+        if self._session is not None or method == "getUpdates" or \
+                threading.current_thread().ident in self._pool_threads:
+            return self._post_now(method, timeout, **kw)
+        with self._pool_lock:
+            if self._pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg-http",
+                                                initializer=self._register_thread)
+        return self._pool.submit(self._post_now, method, timeout, **kw).result()
+
+    def _register_thread(self):
+        self._pool_threads.add(threading.current_thread().ident)
+
+    def _post_now(self, method, timeout, **kw):
         url = f"{self.base}/bot{self.token}/{method}"
         try:
             r = self._http().post(url, timeout=timeout, **kw)

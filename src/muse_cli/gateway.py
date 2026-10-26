@@ -16,6 +16,7 @@ import queue as queue_mod
 
 from curl_cffi import requests as rq
 from curl_cffi.requests import WebSocket
+from curl_cffi.const import CurlInfo
 from noise.connection import NoiseConnection, Keypair
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
@@ -346,7 +347,17 @@ def redeem_invite_code(cookies, code):
 
 
 class Gateway:
-    """One authenticated connection to the personal VM gateway."""
+    """One authenticated connection to the personal VM gateway.
+
+    The connection is multiplexed like the web app's: every request or
+    subscription is its own stream_id, and one reader thread demultiplexes
+    incoming frames into per-stream queues. So any number of threads can
+    run requests and subscriptions on one warm connection at once (no
+    reconnect + Noise handshake per call). libcurl's handle is never used by
+    two threads at once (every ws_send/ws_recv runs under _io_lock; the
+    reader waits for data with select() outside the lock), Noise encrypt is
+    serialized by _send_lock and only the reader thread decrypts.
+    """
 
     def __init__(self, cookies, vm_id=None, access_token=None, hatch_token=None):
         if vm_id is None:
@@ -354,6 +365,7 @@ class Gateway:
         self.vm_id = vm_id
         access_token = access_token or fetch_access_token(cookies)
         hatch_token = hatch_token or fetch_hatch_token(cookies, access_token, vm_id)
+        self.access_token, self.hatch_token = access_token, hatch_token
         url = (f"wss://{GATEWAY_HOST}/v1/noise?vm_id={vm_id}"
                f"&auth_token={urllib.parse.quote(hatch_token, safe='')}")
         self.ws = WebSocket()
@@ -373,9 +385,73 @@ class Gateway:
         self.stream = 1
         self._send_lock = threading.Lock()
         self._recv_lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._partial = {}  # chunk_id -> {chunk_index: payload}
+        self._streams = {}  # stream_id -> Queue of ServiceFrame (or the fatal exception)
+        self._streams_lock = threading.Lock()
+        self.closed = False
+        self.dead = None    # the exception that killed the reader, if any
+        self.last_used = time.time()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True, name="muse-gw-reader")
+        self._reader.start()
+
+    @property
+    def alive(self):
+        return not self.closed and self.dead is None
 
     # -- low-level framing -------------------------------------------------
+    def _write(self, data):
+        if getattr(self, "_io_lock", None) is None:     # bare objects in tests
+            self.ws.send_bytes(data)
+            return
+        from curl_cffi.const import CurlECode, CurlWsFlag
+        from curl_cffi.curl import CurlError
+        from select import select
+        sock = self.ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
+        off = 0
+        while off < len(data):
+            n = None
+            with self._io_lock:
+                try:
+                    n = self.ws.curl.ws_send(data[off:], CurlWsFlag.BINARY)
+                except CurlError as e:
+                    if e.code != CurlECode.AGAIN:
+                        raise ConnectionError(f"gateway send failed: {e}") from None
+            if n is None:
+                _r, w, _x = select([], [sock], [], 5)
+                if not w:
+                    raise ConnectionError("gateway send timed out")
+                continue
+            off += n
+
+    def _recv_message(self):
+        """One complete websocket message (reader thread only)."""
+        from curl_cffi.const import CurlECode, CurlWsFlag
+        from curl_cffi.curl import CurlError
+        from select import select
+        sock = self.ws.curl.getinfo(CurlInfo.ACTIVESOCKET)
+        chunks = []
+        while True:
+            if self.closed:
+                raise ConnectionError("gateway connection closed")
+            frame = None
+            with self._io_lock:
+                try:
+                    chunk, frame = self.ws.curl.ws_recv()
+                except CurlError as e:
+                    if e.code != CurlECode.AGAIN:
+                        raise ConnectionError(f"gateway receive failed: {e}") from None
+            if frame is None:
+                select([sock], [], [], 0.25)
+                continue
+            if frame.flags & CurlWsFlag.CLOSE:
+                raise ConnectionError("gateway closed the websocket")
+            if frame.flags & (CurlWsFlag.PING | CurlWsFlag.PONG):
+                continue
+            chunks.append(chunk)
+            if frame.bytesleft == 0 and not frame.flags & CurlWsFlag.CONT:
+                return b"".join(chunks)
+
     def _send_envelope(self, service_id, frame_bytes):
         # A Noise transport message holds at most 65535 bytes (ciphertext,
         # incl. the 16-byte tag), so a big request (e.g. an fs.write of a
@@ -388,19 +464,16 @@ class Gateway:
             for idx, piece in enumerate(pieces):
                 fr = NoiseTransportFrame(chunk_id=chunk_id, chunk_index=idx,
                                          total_chunks=len(pieces), payload=piece)
-                self.ws.send_bytes(bytes(self.noise.encrypt(fr.SerializeToString())))
+                self._write(bytes(self.noise.encrypt(fr.SerializeToString())))
 
     def _read_frame(self):
-        # Serialized so two threads can never interleave ws.recv / Noise
-        # decrypt (which corrupts the transport state -> BAD_DECRYPT).
-        # Callers must still avoid *logical* races: only one thread should
-        # be consuming frames at a time, or responses get misrouted.
-        # A large response (e.g. /approvals with many recent entries) arrives
-        # as several transport frames sharing a chunk_id; join them in
-        # chunk_index order before parsing the ServiceResponse.
+        # Only the reader thread calls this. A large response (e.g.
+        # /approvals with many recent entries) arrives as several transport
+        # frames sharing a chunk_id; join them in chunk_index order before
+        # parsing the ServiceResponse.
         with self._recv_lock:
             while True:
-                data, _flags = self.ws.recv()
+                data = self._recv_message()
                 pt = bytes(self.noise.decrypt(bytes(data)))
                 ntf = NoiseTransportFrame()
                 ntf.ParseFromString(pt)
@@ -413,7 +486,26 @@ class Gateway:
         sf.ParseFromString(sr.payload)
         return sf
 
-    def _open(self, method, path_params=None, body=None, query=None, route=None):
+    def _read_loop(self):
+        try:
+            while not self.closed:
+                sf = self._read_frame()
+                with self._streams_lock:
+                    q = self._streams.get(sf.stream_id)
+                if q is not None:
+                    q.put(sf)
+        except Exception as e:  # noqa: BLE001
+            if not self.closed:
+                self.dead = e
+            with self._streams_lock:
+                queues = list(self._streams.values())
+            for q in queues:
+                q.put(e if isinstance(e, Exception) else ConnectionError(str(e)))
+
+    def _open(self, method, path_params=None, body=None, query=None, route=None, track=True):
+        """Start a stream. track=False: nobody reads its frames (they are dropped)."""
+        if self.dead is not None or self.closed:
+            raise ConnectionError(f"gateway connection is down ({self.dead or 'closed'})")
         route = route or ROUTES[method]
         path = route["path"]
         for k, v in (path_params or {}).items():
@@ -431,13 +523,49 @@ class Gateway:
             h2 = req.headers.add()
             h2.key = "content-type"
             h2.value = "application/json"
-        frame = ServiceFrame(stream_id=self.stream)
+        with self._streams_lock:
+            sid = self.stream
+            self.stream += 1
+            if track:
+                self._streams[sid] = queue_mod.Queue()
+        frame = ServiceFrame(stream_id=sid)
         frame.request.CopyFrom(req)
-        sid = self.stream
-        self.stream += 1
-        self._send_envelope(SERVICE_IDS.get(route.get("service", "daemon"), 0),
-                            frame.SerializeToString())
+        self.last_used = time.time()
+        try:
+            self._send_envelope(SERVICE_IDS.get(route.get("service", "daemon"), 0),
+                                frame.SerializeToString())
+        except BaseException:
+            self._forget(sid)
+            raise
         return sid
+
+    def _forget(self, sid):
+        with self._streams_lock:
+            self._streams.pop(sid, None)
+
+    def _cancel(self, sid, service=0):
+        """Tell the server we are done with a stream (the web app's encryptReset)."""
+        self._forget(sid)
+        if not self.alive:
+            return
+        frame = ServiceFrame(stream_id=sid)
+        frame.reset.code = 1   # CANCELLED
+        try:
+            self._send_envelope(service, frame.SerializeToString())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _next(self, sid, timeout):
+        with self._streams_lock:
+            q = self._streams.get(sid)
+        if q is None:
+            raise ConnectionError("stream is not open")
+        if self.dead is not None and q.empty():
+            raise ConnectionError(f"gateway connection is down ({self.dead})")
+        sf = q.get(timeout=timeout)
+        if isinstance(sf, Exception):
+            raise ConnectionError(f"gateway connection lost: {sf}")
+        return sf
 
     # -- unary request/response --------------------------------------------
     def request(self, method, path_params=None, body=None, query=None, timeout=30, route=None):
@@ -446,29 +574,48 @@ class Gateway:
             query, body = body, None
         sid = self._open(method, path_params, body, query, route=route)
         status, chunks, deadline = None, [], time.time() + timeout
-        while time.time() < deadline:
-            sf = self._read_frame()
-            if sf.stream_id != sid:
-                continue
-            kind = sf.WhichOneof("kind")
-            if kind == "response":
-                status = sf.response.status
-                if sf.response.body:
-                    chunks.append(bytes(sf.response.body))
-                if sf.response.end_body:
+        ended = False
+        try:
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
                     break
-            elif kind == "body_chunk":
-                chunks.append(bytes(sf.body_chunk.data))
-                if sf.body_chunk.end_body:
+                try:
+                    sf = self._next(sid, left)
+                except queue_mod.Empty:
                     break
-            elif kind == "reset":
-                raise GatewayError(-1, f"stream reset {sf.reset.code}: {sf.reset.reason}")
+                kind = sf.WhichOneof("kind")
+                if kind == "response":
+                    status = sf.response.status
+                    if sf.response.body:
+                        chunks.append(bytes(sf.response.body))
+                    if sf.response.end_body:
+                        ended = True
+                        break
+                elif kind == "body_chunk":
+                    chunks.append(bytes(sf.body_chunk.data))
+                    if sf.body_chunk.end_body:
+                        ended = True
+                        break
+                elif kind == "reset":
+                    ended = True
+                    raise GatewayError(-1, f"stream reset {sf.reset.code}: {sf.reset.reason}")
+        finally:
+            if ended:
+                self._forget(sid)
+            else:
+                self._cancel(sid, SERVICE_IDS.get(route.get("service", "daemon"), 0))
         if status is None:
             raise TimeoutError(f"no response for {method}")
         payload = b"".join(chunks)
         if status < 200 or status >= 300:
             raise GatewayError(status, payload[:500].decode("utf-8", "replace"))
         return payload
+
+    def ping(self, timeout=10):
+        """The web app's heartbeat (connection.ping every 30 s). presence
+        "away" so Muse never takes the bot for the user looking at the app."""
+        return self.call_json("connection.ping", body={"presence": "away"}, timeout=timeout)
 
     # -- files the agent produced (sandbox://...) ---------------------------
     def download_file(self, ref, timeout=300):
@@ -498,58 +645,51 @@ class Gateway:
     # -- subscriptions (ndjson event streams) -------------------------------
     def subscribe_raw(self, method, path_params=None, body=None, query=None,
                       max_records=100, idle_timeout=10, overall_timeout=120,
-                      on_record=None, should_stop=None):
+                      on_record=None, should_stop=None, on_open=None):
         """Open a subscription; returns list of raw record bytes.
 
         ``on_record`` is called with each record the moment it arrives, for
         callers that show events live instead of after the stream ends. If it
         returns a truthy value the subscription stops right there.
-        ``should_stop`` is polled about every 2 s, even while no records
-        arrive; a truthy value ends the subscription.
+        ``should_stop`` is polled about every 0.5 s, even while no records
+        arrive; a truthy value ends the subscription. ``on_open`` is called
+        once the subscription request is on the wire (e.g. to post a message
+        only after the stream that will carry its events exists). A
+        subscription we stop is reset on the server (the connection stays up).
         """
         sid = self._open(method, path_params, body, query)
+        if on_open is not None:
+            on_open()
         buf, records = b"", []
-        q: queue_mod.Queue = queue_mod.Queue()
-        stop = False
-
-        def reader():
-            try:
-                while not stop:
-                    q.put(self._read_frame())
-            except Exception as e:  # noqa: BLE001
-                q.put(e)
-
-        threading.Thread(target=reader, daemon=True).start()
         deadline = time.time() + overall_timeout
         idle = time.time() + idle_timeout
-        halted = False
+        halted = ended = False
         try:
             while not halted and time.time() < deadline and len(records) < max_records:
                 if should_stop is not None and should_stop():
                     halted = True
                     break
                 try:
-                    sf = q.get(timeout=2)
+                    sf = self._next(sid, 0.5)
                 except queue_mod.Empty:
                     if time.time() > idle:
                         break
-                    continue
-                if isinstance(sf, Exception):
-                    raise sf
-                if sf.stream_id != sid:
                     continue
                 idle = time.time() + idle_timeout
                 kind = sf.WhichOneof("kind")
                 if kind == "response":
                     if sf.response.body:
                         buf += bytes(sf.response.body)
-                    if sf.response.end_body and not buf:
-                        break
+                    if sf.response.end_body:
+                        ended = True
+                        if not buf:
+                            break
                 elif kind == "body_chunk":
                     buf += bytes(sf.body_chunk.data)
                     if sf.body_chunk.end_body:
-                        break
+                        ended = True
                 elif kind == "reset":
+                    ended = True
                     break
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
@@ -560,9 +700,13 @@ class Gateway:
                             break
                         if len(records) >= max_records:
                             break
+                if ended:
+                    break
         finally:
-            nonlocal_stop = True
-            stop = nonlocal_stop
+            if ended:
+                self._forget(sid)
+            else:
+                self._cancel(sid)
         if buf.strip() and not halted:
             records.append(buf)
             if on_record:
@@ -579,7 +723,28 @@ class Gateway:
         return out
 
     def close(self):
+        self.closed = True
+        reader = getattr(self, "_reader", None)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=1)     # it notices `closed` within 0.25 s
         try:
-            self.ws.close()
+            with getattr(self, "_io_lock", threading.Lock()):
+                self.ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+    def lease(self):
+        """This connection for code that calls close() when done: close() on
+        the lease is a no-op, so a shared warm connection stays up."""
+        return Lease(self)
+
+
+class Lease:
+    def __init__(self, gw):
+        self._gw = gw
+
+    def __getattr__(self, name):
+        return getattr(self._gw, name)
+
+    def close(self):
+        pass

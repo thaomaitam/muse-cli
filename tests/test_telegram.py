@@ -578,7 +578,7 @@ def test_queue_while_busy(env):
     env.bot.workers[OWNER] = object()
     env.bot.handle_update(msg("second"))
     assert "Queued" in env.tg.sent()[-1]["text"]
-    assert list(env.bot.queues[OWNER]) == [("text", "second")]
+    assert [j[:2] for j in env.bot.queues[OWNER]] == [("text", "second")]
 
 
 # -- profiles --------------------------------------------------------------------------------
@@ -997,7 +997,7 @@ def test_finished_turn_still_cleaning_up_does_not_say_queued(env):
     env.bot.workers[OWNER] = object()
     env.bot.handle_update(msg("next"))
     assert not any("Queued" in (x or "") for x in env.tg.texts())
-    assert list(env.bot.queues[OWNER]) == [("text", "next")]
+    assert [j[:2] for j in env.bot.queues[OWNER]] == [("text", "next")]
 
 
 def test_queue_self_heals_when_server_says_idle(env):
@@ -1432,3 +1432,260 @@ def test_replayed_online_before_the_turn_is_not_shown(env):
     statuses = [t for t in env.tg.texts() if " · " in (t or "")]
     assert statuses and not any("wrapping up" in t for t in statuses[:1])
     assert any(t.startswith("🦆 Planning ducks") for t in statuses)
+
+
+# -- latency: media sent live mid-turn, shared warm connection ---------------------------------
+def live_presentation(path=DUCK, label="Ảnh vịt con"):
+    """The live chat.subscribe record (its seq is the stream's own counter)."""
+    e = presentation(Server(), None, path=path, label=label)
+    return json.dumps({"event": "delta.presentation", "payload": e["payload"], "seq": 3, "type": "event"})
+
+
+def text_append(text, mseq=50):
+    return json.dumps({"event": "delta.text_append", "payload": {"message_seq": mseq, "text": text}})
+
+
+def live_image_script(env, seen, before="Xong rồi, ảnh vịt con đây.", after="Một chú vịt con."):
+    def script(sid):
+        def history():
+            env.s.add(sid, "message.assistant", before)
+            presentation(env.s, sid)
+            env.s.add(sid, "message.assistant", after)
+
+        def check():
+            seen.append(len([d for d in env.tg.docs if d["kind"] == "photo"]))
+        return [ts("running"), text_append(before, 50), live_presentation(), check,
+                text_append(after, 52), history, ts("completed")]
+    return script
+
+
+def test_live_image_is_sent_during_the_turn_in_order_once(env):
+    seen, order = [], []
+    orig_send_file, orig_call = env.tg.send_file, env.tg.call
+
+    def send_file(*a, **kw):
+        order.append("photo")
+        return orig_send_file(*a, **kw)
+
+    def call(method, **p):
+        t = p.get("text") or ""
+        if method in ("sendMessage", "editMessageText") and "⏳" not in t and " · " not in t:
+            order.append((method, t))
+        return orig_call(method, **p)
+    env.tg.send_file, env.tg.call = send_file, call
+    env.s.script = live_image_script(env, seen)
+    env.bot.handle_update(msg("duck"))
+    assert seen == [1]                       # the photo was out before the turn ended
+    assert order == [("editMessageText", "Xong rồi, ảnh vịt con đây."), "photo",
+                     ("editMessageText", "Một chú vịt con.")]
+    assert [x for x in order if x == "photo"] == ["photo"]
+    final = [x for x in order if x != "photo"][-1]
+    assert final[1] == "Một chú vịt con."
+    assert env.s.downloads == [DUCK]         # downloaded once, full file
+    assert env.tg.docs[0]["data"] == b"FILE:" + DUCK.encode()
+    # the monitor and a later look at history do not send it again
+    env.bot.check_background(env.bot.chat_state(OWNER)["session_id"])
+    assert len(env.tg.docs) == 1 and env.s.downloads == [DUCK]
+
+
+def test_live_image_first_drops_status_bubble_and_text_follows(env):
+    order = []
+    orig_send_file, orig_call = env.tg.send_file, env.tg.call
+
+    def send_file(*a, **kw):
+        order.append("photo")
+        return orig_send_file(*a, **kw)
+
+    def call(method, **p):
+        if method == "deleteMessage":
+            order.append("delete")
+        return orig_call(method, **p)
+    env.tg.send_file, env.tg.call = send_file, call
+
+    def script(sid):
+        def history():
+            presentation(env.s, sid)
+            env.s.add(sid, "message.assistant", "Đây là ảnh.")
+        return [ts("running"), live_presentation(), text_append("Đây là ảnh.", 51), history,
+                ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("duck"))
+    assert order == ["delete", "photo"]          # the status-only bubble goes, then the photo
+    assert env.tg.texts()[-1] == "Đây là ảnh."   # the text after it in a bubble below the photo
+
+
+def test_live_image_threaded_goes_out_before_turn_end(home):
+    import time as _t
+    server, tg = Server(), FakeTelegram()
+    seen = []
+    env = types.SimpleNamespace(s=server, tg=tg)
+
+    def script(sid):
+        def wait_photo():           # Muse is still working: give the media worker time
+            end = _t.time() + 3
+            while _t.time() < end and not tg.docs:
+                _t.sleep(0.01)
+            seen.append(len(tg.docs))
+        s = live_image_script(env, [])(sid)
+        return s[:3] + [wait_photo] + s[4:]
+    server.script = script
+    bot = tgbot.Bot(tg, muse=tgbot.Muse(connector=server.connect))
+    bot.edit_interval = 0
+    bot.ensure_monitors = lambda restart=False: None
+    bot.handle_update(msg("duck"))
+    end = _t.time() + 10
+    while _t.time() < end and (bot.turns or bot.workers or bot.queues[OWNER]):
+        _t.sleep(0.02)
+    assert seen == [1]
+    assert len(tg.docs) == 1 and server.downloads == [DUCK]
+    assert tg.texts()[-1] == "Một chú vịt con."
+
+
+class SharedGW:
+    """A gateway that can be shared (lease/alive), like gateway.Gateway."""
+    opened = []
+
+    def __init__(self, server):
+        self.inner = FakeGateway(server)
+        self.dead = None
+        self.closed = False
+        self.last_used = 0
+        self.pings = 0
+        SharedGW.opened.append(self)
+
+    @property
+    def alive(self):
+        return not self.closed and self.dead is None
+
+    def lease(self):
+        from muse_cli.gateway import Lease
+        return Lease(self)
+
+    def ping(self):
+        self.pings += 1
+        if self.dead:
+            raise ConnectionError("gone")
+
+    def call_json(self, *a, **kw):
+        if self.dead:
+            raise ConnectionError("connection lost")
+        return self.inner.call_json(*a, **kw)
+
+    def download_file(self, ref, timeout=300):
+        if self.dead:
+            raise ConnectionError("connection lost")
+        return self.inner.download_file(ref)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def close(self):
+        self.closed = True
+
+
+def test_muse_reuses_one_warm_connection(home):
+    server = Server()
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=lambda cfg: SharedGW(server))
+    for _ in range(5):
+        muse.history(None)
+    with muse.gw() as g:
+        g.call_json("identity")
+    muse.download({"path": DUCK})
+    assert muse.connects == 1 and len(SharedGW.opened) == 1
+    assert not SharedGW.opened[0].closed          # a lease's close() keeps it up
+
+
+def test_muse_reconnects_after_a_drop(home):
+    server = Server()
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=lambda cfg: SharedGW(server))
+    first = muse.history(None)
+    SharedGW.opened[0].dead = ConnectionError("reset by peer")
+    assert muse.history(None) == first            # transparently on a new connection
+    assert muse.connects == 2 and SharedGW.opened[0].closed and SharedGW.opened[1].alive
+
+
+def test_muse_retries_once_when_the_connection_dies_mid_call(home):
+    server = Server()
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=lambda cfg: SharedGW(server))
+    muse.warm()
+    g = SharedGW.opened[0]
+    orig = g.call_json
+    calls = []
+
+    def flaky(*a, **kw):          # alive until the call fails, as when the reader sees the drop
+        calls.append(1)
+        g.dead = ConnectionError("eof")
+        raise ConnectionError("eof")
+    g.call_json = flaky
+    assert muse.call("identity") == {"name": "Muse"}
+    assert calls == [1] and muse.connects == 2
+    g.call_json = orig
+
+
+def test_heartbeat_pings_idle_connection_and_reconnects(home):
+    import time as _t
+    server = Server()
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=lambda cfg: SharedGW(server))
+    muse.warm()
+    muse.start_heartbeat(interval=0.05)
+    end = _t.time() + 3
+    while _t.time() < end and not SharedGW.opened[0].pings:
+        _t.sleep(0.01)
+    assert SharedGW.opened[0].pings >= 1
+    SharedGW.opened[0].dead = ConnectionError("gone")
+    end = _t.time() + 8
+    while _t.time() < end and len(SharedGW.opened) < 2:
+        _t.sleep(0.02)
+    muse.stop_heartbeat()
+    assert len(SharedGW.opened) == 2 and SharedGW.opened[1].alive
+
+
+def test_profile_reload_without_change_keeps_connection(home):
+    server = Server()
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=lambda cfg: SharedGW(server))
+    muse.reload()
+    muse.warm()
+    muse.reload()                                 # e.g. /autoapprove: same cookies and VM
+    assert SharedGW.opened[0].alive
+    muse.reset()                                  # /login, /profile
+    assert SharedGW.opened[0].closed
+
+
+def test_telegram_calls_run_on_warm_pool_threads(monkeypatch):
+    import threading as _th
+    from muse_cli.tgapi import TelegramAPI
+    api = TelegramAPI(TOKEN)
+    names = []
+
+    def post_now(method, timeout, **kw):
+        names.append((method, _th.current_thread().name))
+        return {"ok": True}
+    monkeypatch.setattr(api, "_post_now", post_now)
+    ts_ = [_th.Thread(target=api._post, args=("sendMessage", 5)) for _ in range(3)]
+    for t in ts_:
+        t.start()
+    for t in ts_:
+        t.join()
+    api._post("getUpdates", 5)
+    assert all(n.startswith("tg-http") for m, n in names if m == "sendMessage")
+    assert [n for m, n in names if m == "getUpdates"] == [_th.current_thread().name]
+
+
+def test_live_image_last_removes_the_empty_trailing_bubble(env):
+    def script(sid):
+        def history():
+            env.s.add(sid, "message.assistant", "Đây là ảnh.")
+            presentation(env.s, sid)
+        return [ts("running"), text_append("Đây là ảnh.", 50), live_presentation(), history,
+                ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("duck"))
+    assert len(env.tg.docs) == 1
+    assert len(env.tg.sent("deleteMessage")) == 1     # the status bubble opened after the photo
+    finals = [p["text"] for p in env.tg.sent("editMessageText") if " · " not in p["text"]]
+    assert finals == ["Đây là ảnh."]

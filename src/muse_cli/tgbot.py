@@ -148,33 +148,113 @@ def state_path(home=None):
 class Muse:
     """The Muse calls the bot makes, on the active muse-cli profile.
 
-    Every call opens its own gateway connection (safe from several threads).
-    `connector(cfg)` defaults to `cli.connect`; tests pass a fake gateway.
+    All calls share one warm, multiplexed gateway connection (requests,
+    downloads and subscriptions from any thread run as separate streams on
+    it), kept alive with the web app's heartbeat and reopened transparently
+    when it drops. `connector(cfg)` defaults to `cli.connect`; tests pass a
+    fake gateway. A connector whose gateways cannot be shared (no `lease()`)
+    gets one connection per call, as before.
     """
+
+    HEARTBEAT = 25     # seconds of idleness before a connection.ping
 
     def __init__(self, connector=None, on_auth_error=None, on_auth_ok=None):
         self.connector = connector
         self.cfg = None
         self.on_auth_error = on_auth_error
         self.on_auth_ok = on_auth_ok
+        self.shared = None
+        self.shared_lock = threading.Lock()
+        self.connects = 0          # real connections opened (for tests / logs)
+        self._hb = None
+        self._hb_stop = threading.Event()
 
     def reload(self):
-        self.cfg = cli.load_config()
+        old, self.cfg = self.cfg, cli.load_config()
+        ident = lambda c: c and (c.get("cookies_file"), c.get("vm_id"), c.get("node_id"))
+        if old is not None and ident(old) != ident(self.cfg):
+            self.reset()       # another profile / VM: the warm connection is the wrong one
         return self.cfg
 
     def config(self):
         return self.cfg if self.cfg is not None else self.reload()
 
-    def connect(self, cfg=None):
+    def _open(self, cfg):
         try:
             gw = (self.connector or cli.connect)(cfg or self.config())
         except AuthError as e:
             if self.on_auth_error:
                 self.on_auth_error(e)
             raise
+        self.connects += 1
         if self.on_auth_ok:
             self.on_auth_ok()
         return gw
+
+    def connect(self, cfg=None):
+        """A gateway to use and close(): a lease on the shared connection
+        (close() leaves it up), or a fresh connection if it cannot be shared."""
+        g = self.shared
+        if g is not None and getattr(g, "alive", False):
+            return g.lease()
+        with self.shared_lock:
+            g = self.shared
+            if g is not None and getattr(g, "alive", False):
+                return g.lease()
+            t0 = time.time()
+            gw = self._open(cfg)
+            if not hasattr(gw, "lease"):
+                return gw
+            old, self.shared = self.shared, gw
+            log.info("gateway connected in %.2fs", time.time() - t0)
+        if old is not None:
+            old.close()
+        return gw.lease()
+
+    def warm(self):
+        """Open the shared connection now so the first message does not pay for it."""
+        try:
+            self.connect().close()
+        except Exception as e:  # noqa: BLE001
+            log.warning("gateway warm-up failed: %s", e)
+
+    def reset(self):
+        """Drop the shared connection (new cookies / profile)."""
+        with self.shared_lock:
+            old, self.shared = self.shared, None
+        if old is not None:
+            old.close()
+
+    def start_heartbeat(self, interval=None):
+        if self._hb is not None:
+            return
+        interval = interval or self.HEARTBEAT
+
+        def loop():
+            while not self._hb_stop.wait(min(5, interval)):
+                g = self.shared
+                if g is None:
+                    continue
+                if not getattr(g, "alive", True):
+                    log.info("gateway connection dropped (%s); reconnecting", getattr(g, "dead", None))
+                    self.warm()
+                    continue
+                if time.time() - getattr(g, "last_used", 0) < interval:
+                    continue
+                try:
+                    g.ping()
+                except Exception as e:  # noqa: BLE001
+                    log.info("gateway heartbeat failed (%s); reconnecting", e)
+                    with self.shared_lock:
+                        if self.shared is g:
+                            self.shared = None
+                    g.close()
+                    self.warm()
+        self._hb = threading.Thread(target=loop, daemon=True, name="muse-heartbeat")
+        self._hb.start()
+
+    def stop_heartbeat(self):
+        self._hb_stop.set()
 
     @contextmanager
     def gw(self):
@@ -185,8 +265,28 @@ class Muse:
             g.close()
 
     def call(self, method, **kw):
-        with self.gw() as g:
-            return g.call_json(method, **kw)
+        """call_json on the shared connection; one retry on a fresh connection
+        if the shared one turned out to be dead (reads are safe to repeat)."""
+        for attempt in (0, 1):
+            g = self.connect()
+            try:
+                return g.call_json(method, **kw)
+            except ConnectionError:
+                if attempt:
+                    raise   # the next connect() replaces a dead shared connection
+            finally:
+                g.close()
+
+    def download(self, ref):
+        for attempt in (0, 1):
+            g = self.connect()
+            try:
+                return g.download_file(ref)
+            except ConnectionError:
+                if attempt:
+                    raise
+            finally:
+                g.close()
 
     def history(self, session_id=None, limit=20):
         body = {"limit": limit}
@@ -327,6 +427,27 @@ def _strip_tags(text):
     return _h.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+# -- timing -------------------------------------------------------------------------
+class Timing:
+    """Per-turn phase marks (seconds since the Telegram update arrived), logged
+    as one INFO line when the turn ends: where the bot's own latency goes."""
+
+    def __init__(self, t0=None):
+        self.t0 = t0 or time.time()
+        self.marks = collections.OrderedDict()
+        self.lock = threading.Lock()
+
+    def mark(self, name, once=True):
+        with self.lock:
+            if once and name in self.marks:
+                return
+            self.marks[name] = time.time() - self.t0
+
+    def summary(self):
+        with self.lock:
+            return " ".join(f"{k}={v:.2f}" for k, v in self.marks.items())
+
+
 # -- one Muse turn ---------------------------------------------------------------
 class Turn:
     """A message the bot sent to Muse, streamed into one Telegram message."""
@@ -353,6 +474,32 @@ class Turn:
         self.seen_work = False
         self.lock = threading.Lock()
         self.edit_lock = threading.Lock()   # no streaming edit can land after the final one
+        self.timing = Timing()
+        # media sent live, mid-turn: the bubble is split around each file
+        self.live_seen = set()     # paths seen in delta.presentation
+        self.live_order = []       # paths sent live, in order
+        self.bubbles = []          # the bubble before each live file (None: deleted)
+        self.bubble_text = {}      # bubble id -> final text it already shows
+        self.frozen = {}           # message key -> text length already in an earlier bubble
+        self.media_jobs = []
+        self._media_exec = None
+        self.main_events = threading.Event()   # the turn's own subscription is delivering
+
+    def media_exec(self):
+        if self._media_exec is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._media_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tg-media")
+        return self._media_exec
+
+    def wait_media(self, timeout=300):
+        """Block until every live file of this turn went out (or failed)."""
+        for f in list(self.media_jobs):
+            try:
+                f.result(timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                log.warning("live media: %s", e)
+        if self._media_exec is not None:
+            self._media_exec.shutdown(wait=False)
 
     def take_recheck(self):
         """run_wait polls this: True once after someone asked to re-check the server."""
@@ -369,6 +516,19 @@ class Turn:
             return
         name = event_name(ev) or ""
         p = _payload(ev)
+        tm = self.timing
+        tm.mark("first_event")
+        if name == "agent.status" and p.get("activity_code") not in (None, "online"):
+            tm.mark("first_status")
+        elif name.startswith("delta.text"):
+            tm.mark("first_delta")
+        elif name == "delta.presentation":
+            tm.mark("presentation_seen")
+            if self.msg_id is not None or self.bubbles:
+                try:
+                    self.bot.live_media(self, ev)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("live media: %s", e)
         with self.lock:
             if name == "delta.text_append":
                 key = str(p.get("message_id") or p.get("message_seq") or "m")
@@ -417,9 +577,15 @@ class Turn:
                     self.parts = texts
                     self.dirty = True
 
-    def render(self):
+    def body(self):
+        """Streamed text not yet shown in an earlier (pre-media) bubble."""
         from .wait import clean_text
-        body = clean_text("\n\n".join(t for t in self.parts.values() if t).strip())
+        with self.lock:
+            texts = [t[self.frozen.get(k, 0):] for k, t in self.parts.items()]
+        return clean_text("\n\n".join(t for t in texts if t.strip()).strip())
+
+    def render(self):
+        body = self.body()
         if len(body) > 3300:
             body = "…" + body[-3300:]
         elapsed = fmt_secs(self.bot.clock() - self.started)
@@ -501,6 +667,8 @@ class Bot:
         self.turns = {}            # chat_id -> Turn
         self.queues = collections.defaultdict(collections.deque)
         self.workers = {}
+        from concurrent.futures import ThreadPoolExecutor
+        self.media_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tg-dl")  # concurrent downloads
         self.awaiting = {}         # chat_id -> "cookies"
         self.claimed = set()       # approval ids already being decided
         self.notified = set()      # approval ids already announced
@@ -649,15 +817,15 @@ class Bot:
             raise
 
     def media_key(self, chat_id, session_id, seq, r):
-        return f"{self.profile}|{chat_id}|{session_id or MAIN}|{seq}|{r.get('path')}"
+        # By path, not seq: a live delta.presentation carries its stream's own
+        # counter, the history copy the chat seq; both must dedupe together.
+        return f"{self.profile}|{chat_id}|{session_id or MAIN}|{r.get('path')}"
 
     def media_sent(self, chat_id, session_id, seq, r):
         return self.media_key(chat_id, session_id, seq, r) in self.state.get("sent_media", [])
 
-    def send_media(self, chat_id, session_id, seq, r, prefix=""):
-        """Download one file Muse showed and send it (photo/video/audio/document).
-        Each (chat, session, seq, path) is sent once, whichever path (turn or
-        background monitor) gets there first. A failure becomes a short notice."""
+    def claim_media(self, chat_id, session_id, seq, r):
+        """True once per (chat, session, path): whoever claims it sends it."""
         key = self.media_key(chat_id, session_id, seq, r)
         with self.lock:
             sent = self.state.setdefault("sent_media", [])
@@ -666,6 +834,29 @@ class Bot:
             sent.append(key)
             del sent[:-500]
             self.save_state()
+        return True
+
+    def prefetch(self, r):
+        """Start downloading R now (concurrently); returns a future of its bytes."""
+        from concurrent.futures import Future
+        if self.sync or (r.get("byte_len") or 0) > UPLOAD_LIMIT:
+            f = Future()
+            f.set_result(None)
+            return f
+        return self.media_pool.submit(self._timed_download, r)
+
+    def _timed_download(self, r):
+        t0 = time.time()
+        data = self.muse.download(r)
+        return data, time.time() - t0
+
+    def send_media(self, chat_id, session_id, seq, r, prefix="", fetched=None, claimed=False):
+        """Download one file Muse showed and send it (photo/video/audio/document),
+        full size, as Muse stored it. Each (chat, session, path) is sent once,
+        whichever path (live turn, end of turn, background monitor) gets there
+        first. FETCHED: a prefetch() future. A failure becomes a short notice."""
+        if not claimed and not self.claim_media(chat_id, session_id, seq, r):
+            return False
         name, label = media_name(r), media_label(r)
         caption = (prefix + label).strip() or None
         what = label or name
@@ -673,23 +864,84 @@ class Bot:
             self.send(chat_id, f"📎 {esc(prefix)}<b>{esc(what)}</b> is {r['byte_len'] // (1024 * 1024)} MB, "
                                f"too big for Telegram. Get it with <code>muse-cli download</code>.")
             return True
+        t0 = time.time()
         try:
-            with self.muse.gw() as g:
-                data = g.download_file(r)
+            got = fetched.result() if fetched is not None else None
+            data, dl = got if got else self._timed_download(r)
         except Exception as e:  # noqa: BLE001
             log.warning("media download failed seq=%s %s: %s", seq, name, str(e)[:200])
             self.send(chat_id, f"📎 {esc(prefix)}Muse showed <b>{esc(what)}</b>, but I could not fetch it "
                                f"({esc(type(e).__name__)}). /files lists it for a retry.")
             return True
+        t2 = time.time()
         try:
             self.send_doc(chat_id, name, data, caption=caption, mime=r.get("mime"))
-            log.info("media sent chat=%s seq=%s kind=%s bytes=%d", chat_id, seq,
-                     file_kind(name, r.get("mime"), len(data)), len(data))
+            log.info("media sent chat=%s seq=%s kind=%s bytes=%d download=%.2f wait=%.2f upload=%.2f",
+                     chat_id, seq, file_kind(name, r.get("mime"), len(data)), len(data),
+                     dl, t2 - t0, time.time() - t2)
         except Exception as e:  # noqa: BLE001
             log.warning("media send failed seq=%s %s: %s", seq, name, str(e)[:200])
             self.send(chat_id, f"📎 {esc(prefix)}could not send <b>{esc(what)}</b> to Telegram "
                                f"({esc(str(e)[:150])}).")
         return True
+
+    # -- media shown during a turn: sent the moment it appears ---------------------
+    def live_media(self, turn, ev):
+        """A delta.presentation arrived (subscription thread): start the download
+        now and queue the send on the turn's media worker (one per turn, so the
+        order is Muse's). The streamed bubble is split around the file."""
+        for r in cli.event_resources(ev):
+            path = r["path"]
+            with turn.lock:
+                if path in turn.live_seen:
+                    continue
+                turn.live_seen.add(path)
+            if not self.claim_media(turn.chat_id, turn.session_id, None, r):
+                continue
+            turn.timing.mark("media_claimed")
+            fut = self.prefetch(r)
+            seq = _payload(ev).get("chat_event_seq")
+            if self.sync:
+                self._send_live(turn, r, fut, seq)
+            else:
+                turn.media_jobs.append(turn.media_exec().submit(self._send_live, turn, r, fut, seq))
+
+    def _send_live(self, turn, r, fut, seq=None):
+        chat_id = turn.chat_id
+        try:
+            if fut is not None and not self.sync:
+                try:
+                    fut.result()      # wait for the bytes before touching the bubble
+                except Exception:     # noqa: BLE001 - send_media reports it
+                    pass
+            with turn.edit_lock:
+                body = turn.body()
+                if turn.msg_id is not None:
+                    if body:
+                        try:
+                            self.deliver_reply(chat_id, turn.msg_id, body)
+                            turn.bubble_text[turn.msg_id] = body
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("freeze edit: %s", e)
+                    else:
+                        self.drop_status_bubble(chat_id, turn.msg_id, "🖼 " + (media_label(r) or media_name(r)))
+                turn.bubbles.append(turn.msg_id if body else None)
+                with turn.lock:
+                    for k, v in turn.parts.items():
+                        turn.frozen[k] = len(v)
+                turn.msg_id = None
+                turn.live_order.append(r["path"])
+            self.send_media(chat_id, turn.session_id, seq, r, fetched=fut, claimed=True)
+            turn.timing.mark("media_sent")
+        finally:
+            with turn.edit_lock:
+                if turn.msg_id is None and not turn.finished:
+                    try:
+                        turn.msg_id = self.api.call("sendMessage", chat_id=chat_id,
+                                                    text=turn.render())["message_id"]
+                        turn.shown = None
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("new bubble: %s", e)
 
     def reply_long(self, chat_id, text, stem="output", pre=False, markup=None):
         """Short output as a message (<pre> when pre), long output as a file."""
@@ -782,7 +1034,7 @@ class Bot:
         if media:
             return self.background(self.upload_and_send, chat_id, msg, media)
         if text.strip():
-            self.enqueue(chat_id, ("text", text))
+            self.enqueue(chat_id, ("text", text, time.time()))
 
     def run_command(self, chat_id, uid, name, arg, msg):
         fn = getattr(self, "cmd_" + name, None) if re.fullmatch(r"[a-z_]+", name) else None
@@ -880,26 +1132,54 @@ class Bot:
             log.info("dequeue chat=%s job=%s left=%d", chat_id, job[0], len(self.queues[chat_id]))
             try:
                 if job[0] == "text":
-                    self.run_turn(chat_id, job[1])
+                    self.run_turn(chat_id, job[1], *job[2:])
                 elif job[0] == "resume":
                     self.resume_turn(chat_id, *job[1:])
             except Exception:  # noqa: BLE001
                 log.exception("turn failed")
 
-    def run_turn(self, chat_id, text):
+    def run_turn(self, chat_id, text, t_recv=None):
         cs = dict(self.chat_state(chat_id))
         turn = Turn(self, chat_id, cs["session_id"], cs["title"])
+        turn.timing = Timing(t_recv)
+        turn.timing.mark("dequeued")
         self.turns[chat_id] = turn
         log.info("turn start chat=%s session=%s text=%r", chat_id, turn.session_id or MAIN,
                  short(text))
+        bubble_err = []
+
+        def bubble():
+            try:
+                mid = self.api.call("sendMessage", chat_id=chat_id,
+                                    text="⏳ Sending to Muse…")["message_id"]
+                with turn.edit_lock:
+                    if turn.msg_id is None:
+                        turn.msg_id = mid
+                turn.timing.mark("bubble_sent")
+            except Exception as e:  # noqa: BLE001
+                bubble_err.append(e)
+        bubble_t = None
         try:
-            turn.msg_id = self.api.call("sendMessage", chat_id=chat_id,
-                                        text="⏳ Sending to Muse…")["message_id"]
+            # The status bubble goes to Telegram while the message goes to Muse.
+            if self.sync:
+                bubble()
+            else:
+                bubble_t = threading.Thread(target=bubble, daemon=True, name=f"tg-bubble-{chat_id}")
+                bubble_t.start()
             cfg = self.muse.config()
             gw = self.muse.connect(cfg)
+            turn.timing.mark("connected")
             ticker = None
+            if not self.sync and hasattr(gw, "lease"):
+                threading.Thread(target=self._early_events, args=(turn, gw), daemon=True,
+                                 name=f"tg-early-{chat_id}").start()
             try:
-                user_seq, _sid = cli.deliver(gw, cfg, text, turn.session_id)
+                user_seq, _sid = cli.deliver(gw, cfg, text, turn.session_id, mark=turn.timing.mark)
+                turn.timing.mark("delivered")
+                if bubble_t is not None:
+                    bubble_t.join(timeout=30)
+                if bubble_err:
+                    raise bubble_err[0]
                 log.info("turn delivered chat=%s seq=%s", chat_id, user_seq)
                 if user_seq is None:
                     log.warning("turn chat=%s: no delivery ack", chat_id)
@@ -915,17 +1195,22 @@ class Bot:
                 self._follow(turn, user_seq, require_running=True)
             finally:
                 turn.finished = True
-                if ticker:
-                    ticker.join(timeout=5)
+                turn.main_events.set()
                 gw.close()
         except AuthError:
+            if bubble_t is not None:
+                bubble_t.join(timeout=30)    # edit the bubble rather than leave it behind
             self._turn_error(turn, "🔑 muse.ai login expired. Send new cookies with /login.")
         except Exception as e:  # noqa: BLE001
             log.exception("turn error")
+            if bubble_t is not None:
+                bubble_t.join(timeout=30)
             self._turn_error(turn, f"⚠️ {type(e).__name__}: {str(e)[:400]}")
         finally:
             turn.finished = True
             self.turns.pop(chat_id, None)
+            turn.timing.mark("done")
+            log.info("timing chat=%s %s", chat_id, turn.timing.summary())
 
     def resume_turn(self, chat_id, session_id, title, after_seq):
         """Keep following a turn after a human decided an approval."""
@@ -956,6 +1241,33 @@ class Bot:
         except Exception:  # noqa: BLE001
             pass
 
+    def _early_events(self, turn, gw):
+        """Subscribe before the message is sent: Muse's status shows while the
+        delivery ack is still on its way. Only status lines and files are taken
+        from here (text deltas come from the turn's own subscription), and it
+        ends as soon as that subscription delivers its first record."""
+        from .wait import in_scope
+
+        def on_record(line):
+            if turn.main_events.is_set():
+                return True
+            try:
+                ev = json.loads(line)
+            except (ValueError, TypeError):
+                return False
+            if in_scope(ev, turn.session_id) and event_name(ev) in ("agent.status", "delta.presentation"):
+                turn.on_event(line)
+            return turn.main_events.is_set()
+        body = {"capabilities": ["chat_cancel", "delta_stream"]}
+        if turn.session_id:
+            body["session_id"] = turn.session_id
+        try:
+            gw.subscribe_raw("chat.subscribe", body=body, max_records=10**6, idle_timeout=TURN_TIMEOUT,
+                             overall_timeout=120, on_record=on_record,
+                             should_stop=lambda: turn.main_events.is_set() or turn.finished)
+        except Exception as e:  # noqa: BLE001
+            log.debug("early events: %s", e)
+
     def _tick_turn(self, turn, gw):
         """Flush throttled edits; poll history when no live deltas arrive.
         Uses the sending connection, which nothing else reads during the turn."""
@@ -980,12 +1292,17 @@ class Bot:
 
     def _follow(self, turn, after_seq, require_running):
         cfg = self.muse.config()
+
+        def on_event(line):
+            turn.main_events.set()
+            turn.on_event(line)
         _code, res = cli.run_wait(
             cfg, turn.session_id, after_seq, TURN_TIMEOUT, require_running=require_running,
-            on_event=turn.on_event, auto_approve=self.auto_approve, connector=self.muse.connect,
+            on_event=on_event, auto_approve=self.auto_approve, connector=self.muse.connect,
             approver=self.approve_forever, should_stop=turn.should_stop,
             recheck=turn.take_recheck, recheck_after=WATCHDOG, log=log)
         turn.finish()
+        turn.timing.mark("turn_end")
         log.info("turn end chat=%s session=%s outcome=%s status=%s secs=%.0f replies=%d%s",
                  turn.chat_id, turn.session_id or MAIN, res.get("outcome"), res.get("status"),
                  self.clock() - turn.started, len(res.get("replies") or []),
@@ -1025,7 +1342,13 @@ class Bot:
                              "Muse's replies when they arrive.")
         for e in res.get("auto_approve_errors") or []:
             notes.append(f"⚠️ could not auto-approve {e.get('approval_id')}: {e.get('error')}")
+        turn.wait_media()
         evs = self.turn_history(turn)
+        if turn.live_order:
+            self.finish_split(turn, res, evs, notes, markup)
+            turn.timing.mark("final_edit")
+            self.after_turn(turn, evs)
+            return
         media = [(q, r) for q, r in media_from_events(evs, turn.user_seq or 0)
                  if not self.media_sent(chat_id, turn.session_id, q, r)]
         if len(media) > MAX_FILES_PER_TURN:
@@ -1038,7 +1361,60 @@ class Bot:
             self.deliver_reply(chat_id, turn.msg_id, full, markup, stem=stem)
         else:
             self.deliver_interleaved(turn, res.get("replies") or [], media, notes, markup, stem)
+        turn.timing.mark("final_edit")
         self.after_turn(turn, evs)
+
+    def finish_split(self, turn, res, evs, notes, markup):
+        """Final text when files already went out mid-turn: each reply goes in
+        the bubble between the files it sits between (Muse's seq order), files
+        missed live follow, notes and buttons go last; empty bubbles are removed."""
+        chat_id = turn.chat_id
+        stem = f"muse-reply-{turn.user_seq}"
+        live = {p: i for i, p in enumerate(turn.live_order)}
+        shown = media_from_events(evs, turn.user_seq or 0)
+        items = sorted([(r.get("seq") or 0, 0, "text", r["text"]) for r in res.get("replies") or []
+                        if r.get("text")]
+                       + [(q, 1, "media", r) for q, r in shown], key=lambda x: (x[0], x[1]))
+        groups = [[] for _ in range(len(turn.live_order) + 1)]
+        g, late = 0, []
+        for _q, _o, kind, val in items:
+            if kind == "text":
+                groups[g].append(val)
+            elif val["path"] in live:
+                g = max(g, live[val["path"]] + 1)
+            elif not self.media_sent(chat_id, turn.session_id, _q, val):
+                late.append((_q, val))
+        ids = list(turn.bubbles) + [turn.msg_id]
+        tail = "\n".join(notes)
+        late = late[:MAX_FILES_PER_TURN]
+        carry = []
+        for i, (bid, texts) in enumerate(zip(ids, groups)):
+            last = i == len(ids) - 1
+            texts = carry + texts
+            carry = []
+            if bid is None and not last and texts:
+                carry = texts      # its bubble is gone (the file came first): move on
+                continue
+            body = "\n\n".join(texts).strip()
+            if last and tail and not late:
+                body = (body + "\n\n" + tail).strip()
+            mk = markup if last and not late else None
+            if not body and mk:
+                body = "⬆️"
+            if not body:
+                if bid is not None:
+                    self.drop_status_bubble(chat_id, bid, "⬆️")
+                continue
+            if bid is None:
+                self.send_md(chat_id, body, mk)
+            elif mk is None and turn.bubble_text.get(bid) == body:
+                pass               # already final (frozen before the file)
+            else:
+                self.deliver_reply(chat_id, bid, body, mk, stem=stem)
+        for q, r in late:
+            self.send_media(chat_id, turn.session_id, q, r)
+        if late and (tail or markup):
+            self.send_md(chat_id, tail or "⬆️", markup)
 
     def drop_status_bubble(self, chat_id, msg_id, fallback):
         """Delete a status-only message; if Telegram refuses, turn it into FALLBACK."""
@@ -1698,6 +2074,7 @@ class Bot:
         with os.fdopen(fd, "w") as fh:
             fh.write(text.strip() + "\n")
         os.chmod(path, 0o600)
+        self.muse.reset()      # new cookies: reconnect with them
         try:
             with self.muse.gw() as g:
                 st = cli.status_data(g)
@@ -1889,6 +2266,8 @@ class Bot:
         log.info("bot @%s up (muse-cli %s, profile %s, owner %s, %d allowed)",
                  me.get("username"), __version__, self.profile, self.owner, len(self.allowed))
         self.register_commands()
+        self.muse.warm()           # first message should not pay for connect + handshake
+        self.muse.start_heartbeat()
         self.ensure_monitors()
         offset = self.state.get("offset")
         backoff = 1

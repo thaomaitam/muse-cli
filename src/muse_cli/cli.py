@@ -230,7 +230,28 @@ def connect(cfg):
     cookies = load_cookies(cfg["cookies_file"])
     if not cookies.strip():
         raise AuthError(f"cookies file {cfg['cookies_file']} is empty; run `{cli_cmd('auth export')}`")
-    return Gateway(cookies, vm_id=cfg.get("vm_id"))
+    import hashlib
+    key = hashlib.sha256(cookies.encode()).hexdigest()
+    cached = _TOKENS.get(key)
+    if cached:
+        # Reconnect with the VM id and tokens of the last good connection:
+        # skips 3 HTTPS round trips (api/session, auth/check, hatch/token).
+        try:
+            return Gateway(cookies, vm_id=cached["vm_id"], access_token=cached["access_token"],
+                           hatch_token=cached["hatch_token"])
+        except AuthError:
+            raise
+        except Exception:  # noqa: BLE001 - stale token or VM moved: fetch fresh ones
+            _TOKENS.pop(key, None)
+    gw = Gateway(cookies, vm_id=cfg.get("vm_id"))
+    _TOKENS[key] = {"vm_id": gw.vm_id, "access_token": getattr(gw, "access_token", None),
+                    "hatch_token": getattr(gw, "hatch_token", None)}
+    if not _TOKENS[key]["hatch_token"]:
+        _TOKENS.pop(key, None)
+    return gw
+
+
+_TOKENS = {}   # sha256(cookies) -> vm_id + tokens of the last good connection (memory only)
 
 
 def out(obj):
@@ -893,9 +914,18 @@ def is_reply(ev, baseline):
 # How often a waiting send re-reads history. A history read is one small
 # unary call; at 4 s a finished reply sat unshown for up to 4 s.
 POLL = 1
+ACK_POLL = 0.1   # delivery-ack history checks: one cheap round trip each on a warm connection
 
 
-def deliver(gw, cfg, text, thread=None, ack_timeout=30):
+def _accepts_track(gw):
+    import inspect
+    try:
+        return "track" in inspect.signature(gw._open).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def deliver(gw, cfg, text, thread=None, ack_timeout=30, mark=None):
     """Send TEXT on gw and wait for the delivery ack; returns (user_seq, stream_id).
 
     user_seq is None when no ack arrived within ack_timeout. Keep gw open
@@ -916,7 +946,13 @@ def deliver(gw, cfg, text, thread=None, ack_timeout=30):
             baseline = max(e.get("seq", 0) for e in evs)
     except (GatewayError, TimeoutError):
         pass
-    stream_sid = gw._open("chat.stream", body=params)
+    mark = mark or (lambda name: None)
+    mark("baseline")
+    # Nobody reads chat.stream's own frames (the turn is followed on
+    # chat.subscribe); on a shared connection they are simply dropped.
+    stream_sid = gw._open("chat.stream", body=params, track=False) if _accepts_track(gw) \
+        else gw._open("chat.stream", body=params)
+    mark("posted")
     # Wait for delivery: our message.user must show up in history with a
     # seq. Closing the connection before that can drop the message.
     from .wait import user_ack
@@ -928,7 +964,7 @@ def deliver(gw, cfg, text, thread=None, ack_timeout=30):
         except (GatewayError, TimeoutError):
             pass
         if user_seq is None:
-            time.sleep(POLL)
+            time.sleep(min(POLL, ACK_POLL))
     return user_seq, stream_sid
 
 
@@ -944,12 +980,12 @@ def cmd_send(args):
     # The sending connection stays open until we are done waiting, so the
     # chat.stream request is never torn down mid-turn.
     try:
-        _send_finish(args, cfg, scope, user_seq, stream_sid)
+        _send_finish(args, cfg, scope, user_seq, stream_sid, gw)
     finally:
         gw.close()
 
 
-def _send_finish(args, cfg, scope, user_seq, stream_sid):
+def _send_finish(args, cfg, scope, user_seq, stream_sid, gw=None):
     result = {"sent": True, "delivered": user_seq is not None, "user_seq": user_seq,
               "stream": stream_sid}
     if user_seq is None:
@@ -960,8 +996,11 @@ def _send_finish(args, cfg, scope, user_seq, stream_sid):
     if not wait_s:
         out(result)
         return
+    # Follow the turn on the connection that sent it (multiplexed): no new
+    # connect + Noise handshake per subscription or history read.
+    conn = (lambda _cfg: gw.lease()) if gw is not None and hasattr(gw, "lease") else None
     code, res = run_wait(cfg, args.thread, user_seq, wait_s, require_running=True,
-                         auto_approve=args.auto_approve)
+                         auto_approve=args.auto_approve, connector=conn)
     result.update(outcome=res["outcome"], status=res["status"], final_text=res["final_text"],
                   replies=res["replies"])
     for k in ("approvals", "auto_approved", "auto_approve_errors", "widgets", "question",
