@@ -1136,3 +1136,13 @@ def test_keepalives_do_not_feed_the_watchdog(home):
 def test_online_status_label():
     ev_ = json.loads(_online())
     assert tgbot.status_from_event(ev_) == "⏳ Muse is wrapping up…"
+
+
+def test_upload_failure_is_reported_not_silent(env):
+    def boom(fn):
+        raise ValueError("Data must be bytes and less or equal 65535 bytes in length")
+    env.bot.muse.fs = boom
+    env.tg.files["F9"] = b"x" * 70000
+    env.bot.handle_update(msg(document={"file_id": "F9", "file_name": "big.bin"}))
+    assert "Upload to System Files failed" in env.tg.sent()[-1]["text"]
+    assert not env.s.sent_texts

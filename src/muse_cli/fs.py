@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 CHUNK = 4 * 1024 * 1024   # fs.read window
-WRITE_CHUNK = 4 * 1024 * 1024
+WRITE_CHUNK = 1024 * 1024   # raw bytes per fs.write; base64 body must stay under the gateway limit (4 MiB raw -> 413)
 
 
 def norm(path):

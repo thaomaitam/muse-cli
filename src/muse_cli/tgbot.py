@@ -1105,6 +1105,10 @@ class Bot:
             return self.send(chat_id, "🔑 muse.ai login expired. Use /login.")
         except (GatewayError, TimeoutError) as e:
             return self.send(chat_id, f"⚠️ Upload to System Files failed: {esc(str(e)[:300])}")
+        except Exception as e:  # noqa: BLE001 - never fail silently on the user
+            log.exception("upload failed path=%s bytes=%d", path, len(data))
+            return self.send(chat_id, f"⚠️ Upload to System Files failed ({esc(type(e).__name__)}): "
+                                      f"{esc(str(e)[:300])}")
         caption = (msg.get("caption") or "").strip()
         note = (f"[Telegram attachment saved in your System Files at {path} "
                 f"({len(data)} bytes{', ' + media['mime'] if media.get('mime') else ''})]")

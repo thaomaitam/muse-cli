@@ -74,6 +74,11 @@ def media_path(ref):
     return "/media/raw/" + urllib.parse.quote(rel, safe="/")
 
 
+# Max payload bytes per outgoing transport frame: 65535 Noise limit minus the
+# 16-byte AEAD tag and the NoiseTransportFrame field overhead, with margin.
+SEND_PIECE = 60000
+
+
 def join_chunks(partial, ntf):
     """Feed one NoiseTransportFrame; return the full payload once complete."""
     total = ntf.total_chunks or 1
@@ -372,12 +377,18 @@ class Gateway:
 
     # -- low-level framing -------------------------------------------------
     def _send_envelope(self, service_id, frame_bytes):
-        outer = ServiceRequest(service=service_id, payload=frame_bytes)
+        # A Noise transport message holds at most 65535 bytes (ciphertext,
+        # incl. the 16-byte tag), so a big request (e.g. an fs.write of a
+        # photo) is split into transport frames sharing a chunk_id, the same
+        # framing the server uses for large responses (see join_chunks).
+        outer = ServiceRequest(service=service_id, payload=frame_bytes).SerializeToString()
         chunk_id = struct.unpack("<q", os.urandom(8))[0]
-        fr = NoiseTransportFrame(chunk_id=chunk_id, chunk_index=0, total_chunks=1,
-                                 payload=outer.SerializeToString())
+        pieces = [outer[i:i + SEND_PIECE] for i in range(0, len(outer), SEND_PIECE)] or [b""]
         with self._send_lock:
-            self.ws.send_bytes(bytes(self.noise.encrypt(fr.SerializeToString())))
+            for idx, piece in enumerate(pieces):
+                fr = NoiseTransportFrame(chunk_id=chunk_id, chunk_index=idx,
+                                         total_chunks=len(pieces), payload=piece)
+                self.ws.send_bytes(bytes(self.noise.encrypt(fr.SerializeToString())))
 
     def _read_frame(self):
         # Serialized so two threads can never interleave ws.recv / Noise
