@@ -195,6 +195,8 @@ muse-cli session-rename <id> "new title"
 muse-cli session-archive <id>                     # also: pin, unpin, unarchive, delete
 muse-cli seen <thread-id>
 muse-cli wake
+muse-cli stop [--thread <session-id>]           # stop Muse's current turn
+muse-cli telegram setup                           # Telegram bot; see Telegram bot below
 
 muse-cli fs ls [PATH] [-l] [-a] [--json]           # System Files (agent home); "" or / is the root
 muse-cli fs tree memory --depth 3                 # recursive listing
@@ -246,6 +248,84 @@ muse-cli --profile work auto-approve on          # settings are per profile
 muse-cli auth list                               # profiles, active one (*), cookies or not; offline
 muse-cli auth list --json
 ```
+
+## Telegram bot
+
+Run your Muse entirely from Telegram: chat (replies stream into one message),
+answer Muse's questions with buttons, send photos and files, switch chats,
+approve, browse System Files, and more. `muse-cli telegram` talks to the
+Telegram Bot API directly (long polling, no webhook, no extra dependency) and
+uses the active profile's muse.ai login.
+
+**1. Create a bot.** In Telegram, open [@BotFather](https://t.me/BotFather),
+send `/newbot`, pick a name and a username, and copy the token it gives you
+(`123456789:AA...`). Keep it secret.
+
+**2. Save the token and pair your account** (on the machine that will run the bot):
+
+```bash
+muse-cli telegram setup            # paste the token at the hidden prompt
+```
+
+The token is never a command-line argument; you can also pipe it:
+`muse-cli telegram setup < token.txt`. Setup checks the token, then prints a
+code: open the bot link it shows and send `/start CODE`. That Telegram account
+becomes the owner and the only allowed user. Add more user ids with
+`--allow USER_ID`. Everything is saved in `telegram.json` (mode 600) in the
+active profile's folder (`~/.config/muse-cli/` or
+`~/.config/muse-cli/profiles/NAME/`). Use `--profile NAME` to bridge another login.
+
+**3. Run it as a service** (systemd, `Restart=always`):
+
+```bash
+muse-cli telegram install-service          # as root: /etc/systemd/system/muse-telegram.service
+muse-cli telegram install-service --user   # or a systemd --user unit
+muse-cli telegram install-service --dry-run   # just print the unit
+muse-cli telegram status                   # config, allowed users, token check, service state
+journalctl -u muse-telegram -f             # logs
+```
+
+Or run it in a terminal: `muse-cli telegram run`. With `--profile NAME` the
+unit is `muse-telegram-NAME.service` and runs `muse-cli --profile NAME telegram run`.
+
+**Using it.** Type to talk to Muse in the current conversation (main chat by
+default; each Telegram chat remembers its own). The reply streams into one
+message, long replies are split, and very long ones or big code blocks arrive
+as a `.md`/`.txt` file. When Muse asks something, its options (or Yes / No /
+Go ahead) show up as buttons; tap one or just type the answer. Photos and
+files you send are saved to System Files under `telegram-inbox/` and Muse is
+told the path (with your caption). Files Muse makes are sent back. Messages
+sent while Muse is busy are queued.
+
+| Command | What it does |
+|---|---|
+| `/help`, `/start` | command overview |
+| `/status` | what Muse is doing now, identity, VM, profile, auto-approve |
+| `/stop` | stop Muse's current turn (the app's Stop button, `chat.cancel`) |
+| `/chats` | your side chats as buttons (paginated); tap to open |
+| `/main`, `/new [title]` | back to the main chat / start a side chat |
+| `/history [N]`, `/unread` | last N messages here / unread counts |
+| `/rename <title>`, `/pin`, `/unpin`, `/archive`, `/unarchive`, `/delete` | manage the current side chat (`/delete` asks first) |
+| `/approvals` | pending approvals with Always allow / Deny buttons |
+| `/autoapprove on\|off\|status` | default **on**: every approval gets Muse's forever choice (`allow_always`) so Muse never blocks |
+| `/watch on\|off` | forward live tool/progress events (batched) |
+| `/files` | recent files Muse made; tap to download |
+| `/fs ls\|tree\|cat\|get\|find\|stat\|mkdir\|mv\|rm …` | System Files (`rm` asks first; long `cat` comes as a file) |
+| `/feed`, `/goals`, `/goal <id>`, `/ideas` | feed, goals, idea cards (each with an Execute button) |
+| `/usage`, `/wake` | plan usage / wake the VM |
+| `/profile` | show and switch muse-cli profiles (owner) |
+| `/login` | send new muse.ai cookies (file or `hatch_sess=…` line) when they expire (owner) |
+| `/update` | run the same upgrade as `muse-cli update`, then restart the bot (owner) |
+| `/raw <method> [json]` | any gateway method; path params in `{"_params": {...}}` (owner) |
+
+In the background the bot also forwards Muse messages that arrive outside a
+turn it started (scheduled work, messages sent from the web app), new
+approvals when auto-approve is off, a "done" ping for long turns, and a
+one-time notice when the muse.ai cookies expire.
+
+Security: updates from anyone not on the allowlist are ignored without a
+reply, the token is never logged, and network errors back off and retry.
+`muse-cli stop [--thread ID]` is the same stop from the terminal.
 
 ## How it works
 

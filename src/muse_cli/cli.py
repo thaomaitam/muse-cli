@@ -467,14 +467,19 @@ def cmd_auth_export(_args):
     print(f"saved {len(jar)} muse.ai cookies to {COOKIES_FILE}")
 
 
+def status_data(gw):
+    """VM id, session count, unread counts and identity (what `status` prints)."""
+    sess = gw.call_json("sessions.list")
+    unread = gw.call_json("chat.unread_count")
+    ident = gw.call_json("identity")
+    return {"vm_id": gw.vm_id, "sessions": len(sess.get("sessions", [])),
+            "unread": unread, "identity": ident}
+
+
 def cmd_status(_args):
     gw = connect(load_config())
     try:
-        sess = gw.call_json("sessions.list")
-        unread = gw.call_json("chat.unread_count")
-        ident = gw.call_json("identity")
-        out({"vm_id": gw.vm_id, "sessions": len(sess.get("sessions", [])),
-             "unread": unread, "identity": ident})
+        out(status_data(gw))
     finally:
         gw.close()
 
@@ -545,8 +550,8 @@ def _human_tokens(n):
     return str(n)
 
 
-def cmd_usage(args):
-    cfg = load_config()
+def fetch_usage(cfg):
+    """The raw subscription object; caches the server action id in config."""
     if not os.path.exists(cfg["cookies_file"]):
         connect(cfg)  # raises the usual "run auth export" error
     sub, aid = fetch_subscription(load_cookies(cfg["cookies_file"]),
@@ -555,13 +560,12 @@ def cmd_usage(args):
         cfg["subscription_action_id"] = aid
         ensure_config_dir()
         json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
-    if args.raw:
-        out(sub)
-        return
-    u = summarize_usage(sub)
-    if args.json:
-        out(u)
-        return
+    return sub
+
+
+def usage_lines(u):
+    """`usage` as human lines, from summarize_usage()."""
+    lines = []
     head = u["label"] or u["plan"] or "Plan"
     if u["value_label"]:
         line = f"{head}: {u['value_label']}"
@@ -571,16 +575,30 @@ def cmd_usage(args):
         line = f"{head}: {u['state'] or 'unknown'}"
     if u["resets_at"]:
         line += f" (resets {u['resets_at'][:16].replace('T', ' ')} {time.strftime('%Z')})"
-    print(line)
+    lines.append(line)
     if u["quota_status"] and u["quota_status"] != "SUFFICIENT":
-        print(f"  quota: {u['quota_status']}")
+        lines.append(f"  quota: {u['quota_status']}")
     b = u["bonus_tokens"]
     if b:
-        print(f"{b['label']}: {b['value_label']} (never expire)")
+        lines.append(f"{b['label']}: {b['value_label']} (never expire)")
     else:
-        print("Additional tokens: none")
+        lines.append("Additional tokens: none")
     if u["upgrade"] and not u["paid"]:
-        print("Upgrade: https://muse.ai/settings")
+        lines.append("Upgrade: https://muse.ai/settings")
+    return lines
+
+
+def cmd_usage(args):
+    sub = fetch_usage(load_config())
+    if args.raw:
+        out(sub)
+        return
+    u = summarize_usage(sub)
+    if args.json:
+        out(u)
+        return
+    for line in usage_lines(u):
+        print(line)
 
 
 def summarize_invite(d):
@@ -654,21 +672,25 @@ def cmd_redeem(args):
         sys.exit(1)
 
 
+def session_rows(d, include_archived=False):
+    """sessions.list -> the rows `threads` prints."""
+    rows = [{
+        "session_id": s.get("session_id"),
+        "title": s.get("title"),
+        "thread": s.get("is_thread"),
+        "pinned": s.get("pinned"),
+        "archived": s.get("archived"),
+        "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("updated_at_ms", 0) / 1000)),
+        } for s in d.get("sessions", [])]
+    if not include_archived:
+        rows = [r for r in rows if not r["archived"]]
+    return rows
+
+
 def cmd_threads(args):
     gw = connect(load_config())
     try:
-        d = gw.call_json("sessions.list")
-        rows = [{
-            "session_id": s.get("session_id"),
-            "title": s.get("title"),
-            "thread": s.get("is_thread"),
-            "pinned": s.get("pinned"),
-            "archived": s.get("archived"),
-            "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(s.get("updated_at_ms", 0) / 1000)),
-        } for s in d.get("sessions", [])]
-        if args.archived is False:
-            rows = [r for r in rows if not r["archived"]]
-        out(rows)
+        out(session_rows(gw.call_json("sessions.list"), include_archived=bool(args.archived)))
     finally:
         gw.close()
 
@@ -796,16 +818,21 @@ def _history_events(gw, thread, limit):
     return gw.call_json("chat.history", body=params).get("chat_events", [])
 
 
+def file_rows(events):
+    """One row per file referenced by these history events (what `files` prints)."""
+    rows = []
+    for ev in events:
+        p = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
+        for r in event_resources(ev):
+            rows.append({"seq": ev.get("seq"),
+                         "message_id": p.get("message_id") or ev.get("message_id"), **r})
+    return rows
+
+
 def cmd_files(args):
     gw = connect(load_config())
     try:
-        rows = []
-        for ev in _history_events(gw, args.thread, args.limit):
-            p = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
-            for r in event_resources(ev):
-                rows.append({"seq": ev.get("seq"),
-                             "message_id": p.get("message_id") or ev.get("message_id"), **r})
-        out(rows)
+        out(file_rows(_history_events(gw, args.thread, args.limit)))
     finally:
         gw.close()
 
@@ -868,38 +895,49 @@ def is_reply(ev, baseline):
 POLL = 1
 
 
+def deliver(gw, cfg, text, thread=None, ack_timeout=30):
+    """Send TEXT on gw and wait for the delivery ack; returns (user_seq, stream_id).
+
+    user_seq is None when no ack arrived within ack_timeout. Keep gw open
+    until the turn is over: closing it early can drop the chat.stream request.
+    """
+    params = {"items": [{"type": "text", "text": text}],
+              "node_id": cfg["node_id"], "capabilities": {}}
+    if thread:
+        params["session_id"] = thread
+    # chat.history without session_id reads the main chat; with it, the
+    # thread. Either way the scope matches where the reply will land.
+    scope = {"session_id": thread} if thread else {}
+    baseline = 0
+    try:
+        h = gw.call_json("chat.history", body={"limit": 1, **scope})
+        evs = h.get("chat_events", [])
+        if evs:
+            baseline = max(e.get("seq", 0) for e in evs)
+    except (GatewayError, TimeoutError):
+        pass
+    stream_sid = gw._open("chat.stream", body=params)
+    # Wait for delivery: our message.user must show up in history with a
+    # seq. Closing the connection before that can drop the message.
+    from .wait import user_ack
+    user_seq, ack_deadline = None, time.time() + ack_timeout
+    while user_seq is None and time.time() < ack_deadline:
+        try:
+            h = gw.call_json("chat.history", body={"limit": 10, **scope})
+            user_seq = user_ack(h.get("chat_events", []), baseline, text)
+        except (GatewayError, TimeoutError):
+            pass
+        if user_seq is None:
+            time.sleep(POLL)
+    return user_seq, stream_sid
+
+
 def cmd_send(args):
     cfg = load_config()
     gw = connect(cfg)
+    scope = {"session_id": args.thread} if args.thread else {}
     try:
-        params = {"items": [{"type": "text", "text": args.text}],
-                  "node_id": cfg["node_id"], "capabilities": {}}
-        if args.thread:
-            params["session_id"] = args.thread
-        # chat.history without session_id reads the main chat; with it, the
-        # thread. Either way the scope matches where the reply will land.
-        scope = {"session_id": args.thread} if args.thread else {}
-        baseline = 0
-        try:
-            h = gw.call_json("chat.history", body={"limit": 1, **scope})
-            evs = h.get("chat_events", [])
-            if evs:
-                baseline = max(e.get("seq", 0) for e in evs)
-        except (GatewayError, TimeoutError):
-            pass
-        stream_sid = gw._open("chat.stream", body=params)
-        # Wait for delivery: our message.user must show up in history with a
-        # seq. Closing the connection before that can drop the message.
-        from .wait import user_ack
-        user_seq, ack_deadline = None, time.time() + args.ack_timeout
-        while user_seq is None and time.time() < ack_deadline:
-            try:
-                h = gw.call_json("chat.history", body={"limit": 10, **scope})
-                user_seq = user_ack(h.get("chat_events", []), baseline, args.text)
-            except (GatewayError, TimeoutError):
-                pass
-            if user_seq is None:
-                time.sleep(POLL)
+        user_seq, stream_sid = deliver(gw, cfg, args.text, args.thread, args.ack_timeout)
     except BaseException:
         gw.close()
         raise
@@ -965,7 +1003,7 @@ def decide_approval(gw, approval_id, decision):
                         body={"decision": decision})
 
 
-def make_auto_approver(cfg, approved, errors):
+def make_auto_approver(cfg, approved, errors, connector=None):
     """Approver for Waiter: allow_always each new approval on its own connection
     (the subscription's reader owns the other one). Logs to stderr, records
     successes in `approved` and failures in `errors`; returns handled ids."""
@@ -974,7 +1012,7 @@ def make_auto_approver(cfg, approved, errors):
     def approve(items):
         done = []
         try:
-            gw = connect(cfg)
+            gw = (connector or connect)(cfg)
         except Exception as e:  # noqa: BLE001 - surface, then stop with exit 4
             for a in items:
                 errors.append({"approval_id": a["approval_id"], "error": str(e)})
@@ -1007,12 +1045,16 @@ def make_auto_approver(cfg, approved, errors):
 
 
 def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
-             on_event=None, auto_approve=None):
+             on_event=None, auto_approve=None, connector=None, approver=None,
+             should_stop=None):
     """Subscribe until the turn ends, a human is needed, or timeout.
 
     auto_approve: True/False per call, None to use MUSE_AUTO_APPROVE or the
     config (`muse-cli auto-approve`). When on, pending approvals are approved
     with allow_always and the wait goes on; questions still end it.
+    connector: callable(cfg) -> gateway (default `connect`). approver: replaces
+    the built-in auto-approver when auto-approve is on. should_stop: callable
+    polled every couple of seconds; True ends the wait early (outcome timeout).
 
     Returns (exit_code, result). The final replies are re-read from
     chat.history on a fresh connection (the subscription's reader thread
@@ -1022,8 +1064,12 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     scope = {"session_id": thread} if thread else {}
     enabled, _src = auto_approve_setting(cfg, auto_approve)
     approved, approve_errors = [], []
-    approver = make_auto_approver(cfg, approved, approve_errors) if enabled else None
-    gw = connect(cfg)
+    conn = connector or connect
+    if enabled:
+        approver = approver or make_auto_approver(cfg, approved, approve_errors, connector=conn)
+    else:
+        approver = None
+    gw = conn(cfg)
     try:
         if after_seq is None:
             h = gw.call_json("chat.history", body={"limit": 1, **scope})
@@ -1037,13 +1083,14 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
             if on_event:
                 on_event(line)
             return w.feed(line) is not None
+        kw = {"should_stop": should_stop} if should_stop else {}
         gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9,
-                         idle_timeout=timeout, overall_timeout=timeout, on_record=on_record)
+                         idle_timeout=timeout, overall_timeout=timeout, on_record=on_record, **kw)
     finally:
         gw.close()
     kind, detail = w.result or ("timeout", w.status)
     replies = []
-    gw = connect(cfg)
+    gw = conn(cfg)
     try:
         h = gw.call_json("chat.history", body={"limit": 30, **scope})
         replies = replies_after(h.get("chat_events", []), after_seq)
@@ -1197,21 +1244,47 @@ def cmd_watch(args):
         gw.close()
 
 
+def feed_rows(d, limit=None):
+    rows = []
+    for day in d.get("days", []):
+        for ed in day.get("editions", []):
+            for u in ed.get("units", []):
+                rows.append({"id": u.get("unit_id"),
+                             "title": u.get("title"),
+                             "date": day.get("local_date"),
+                             "edition": ed.get("kind")})
+    return rows[:limit] if limit else rows
+
+
+def goal_rows(d):
+    return [{"id": g.get("id") or g.get("goal_id"), "title": g.get("title"),
+             "status": g.get("status"), "subtitle": g.get("subtitle")}
+            for g in d.get("goals", [])]
+
+
+def idea_rows(d):
+    rows = []
+    for s in d.get("sections", []):
+        for c in s.get("cards", s.get("ideas", [])):
+            rows.append({"id": c.get("id") or c.get("ideaCardId"),
+                         "title": c.get("title"), "section": s.get("title")})
+    return rows
+
+
+def idea_execute(gw, idea_id, thread=None):
+    body = {"ideaCardId": idea_id, "mode": "full"}
+    if thread:
+        body["session_id"] = thread
+    return gw.call_json("api.idea-cards.execute", path_params={"ideaCardId": idea_id}, body=body)
+
+
 def cmd_feed(args):
     gw = connect(load_config())
     try:
         d = gw.call_json("feed.list", query={"limit": args.limit} if args.limit else None)
         if args.raw:
             out(d); return
-        rows = []
-        for day in d.get("days", []):
-            for ed in day.get("editions", []):
-                for u in ed.get("units", []):
-                    rows.append({"id": u.get("unit_id"),
-                                 "title": u.get("title"),
-                                 "date": day.get("local_date"),
-                                 "edition": ed.get("kind")})
-        out(rows[:args.limit] if args.limit else rows)
+        out(feed_rows(d, args.limit))
     finally:
         gw.close()
 
@@ -1244,10 +1317,7 @@ def cmd_feed_prompt(_args):
 def cmd_goals(_args):
     gw = connect(load_config())
     try:
-        d = gw.call_json("goals.list")
-        out([{"id": g.get("id") or g.get("goal_id"), "title": g.get("title"),
-              "status": g.get("status"), "subtitle": g.get("subtitle")}
-             for g in d.get("goals", [])])
+        out(goal_rows(gw.call_json("goals.list")))
     finally:
         gw.close()
 
@@ -1263,13 +1333,7 @@ def cmd_goal(args):
 def cmd_ideas(_args):
     gw = connect(load_config())
     try:
-        d = gw.call_json("api.idea-cards.list")
-        rows = []
-        for s in d.get("sections", []):
-            for c in s.get("cards", s.get("ideas", [])):
-                rows.append({"id": c.get("id") or c.get("ideaCardId"),
-                             "title": c.get("title"), "section": s.get("title")})
-        out(rows)
+        out(idea_rows(gw.call_json("api.idea-cards.list")))
     finally:
         gw.close()
 
@@ -1285,10 +1349,7 @@ def cmd_idea(args):
 def cmd_idea_exec(args):
     gw = connect(load_config())
     try:
-        body = {"ideaCardId": args.id, "mode": "full"}
-        if args.thread:
-            body["session_id"] = args.thread
-        out(gw.call_json("api.idea-cards.execute", path_params={"ideaCardId": args.id}, body=body))
+        out(idea_execute(gw, args.id, args.thread))
     finally:
         gw.close()
 
@@ -1309,14 +1370,44 @@ def cmd_seen(args):
         gw.close()
 
 
+def session_start(gw, title=None):
+    """Start a new side chat; returns the server reply (has session_id)."""
+    params = {"origin": "fresh", "lifecycle": "persistent"}
+    if title:
+        params["title"] = title
+    return gw.call_json("session.start", body={"method": "/api/session/start", "params": params})
+
+
+def session_op(gw, kind, session_id, title=None):
+    """rename | pin | unpin | archive | unarchive | delete one session."""
+    if kind == "rename":
+        body = {"session_id": session_id, "title": title}
+    else:
+        body = {"method": f"/api/session/{kind}", "session_id": session_id}
+    return gw.call_json(f"session.{kind}", body=body)
+
+
+def cancel_turn(gw, thread=None):
+    """Stop Muse's current turn (the web app's Stop button): POST /chat/cancel.
+
+    Body is {} for the main chat or {"session_id": ID} for a side chat, as the
+    web client sends it. Returns the reply, e.g. {"cancelled": true}.
+    """
+    return gw.call_json("chat.cancel", body={"session_id": thread} if thread else {})
+
+
+def cmd_stop(args):
+    gw = connect(load_config())
+    try:
+        out(cancel_turn(gw, args.thread))
+    finally:
+        gw.close()
+
+
 def cmd_session_start(args):
     gw = connect(load_config())
     try:
-        params = {"origin": "fresh", "lifecycle": "persistent"}
-        if args.title:
-            params["title"] = args.title
-        out(gw.call_json("session.start",
-                         body={"method": "/api/session/start", "params": params}))
+        out(session_start(gw, args.title))
     finally:
         gw.close()
 
@@ -1325,18 +1416,14 @@ def cmd_session_op(kind):
     def run(args):
         gw = connect(load_config())
         try:
-            if kind == "rename":
-                body = {"session_id": args.id, "title": args.title}
-            else:
-                body = {"method": f"/api/session/{kind}", "session_id": args.id}
-            out(gw.call_json(f"session.{kind}", body=body))
+            out(session_op(gw, kind, args.id, getattr(args, "title", None)))
         finally:
             gw.close()
     return run
 
 
-def cmd_wake(_args):
-    cfg = load_config()
+def wake_vm(cfg):
+    """Ask muse.ai to wake the VM; returns {"status": http_status, "body": ...}."""
     from .gateway import _hatch_headers, fetch_access_token, fetch_session_info
     from curl_cffi import requests as rq
     cookies = load_cookies(cfg["cookies_file"])
@@ -1345,7 +1432,15 @@ def cmd_wake(_args):
     resp = rq.post("https://muse.ai/api/hatch/vm/wake", headers=_hatch_headers(cookies, at),
                    json={"vm_id": vm_id, "retry_count": 0},
                    impersonate="chrome", timeout=15)
-    out({"status": resp.status_code, "body": resp.json() if resp.text else None})
+    try:
+        body = resp.json() if resp.text else None
+    except ValueError:
+        body = resp.text[:300]
+    return {"status": resp.status_code, "body": body}
+
+
+def cmd_wake(_args):
+    out(wake_vm(load_config()))
 
 
 def cmd_raw(args):
@@ -1368,14 +1463,22 @@ def cmd_raw(args):
         pp[k] = v
     gw = connect(load_config())
     try:
-        data = gw.request(args.method, path_params=pp or None, body=body,
-                          query=None, timeout=args.timeout)
-        try:
-            out(json.loads(data) if data else {})
-        except json.JSONDecodeError:
-            print(data.decode("utf-8", "replace"))
+        res = raw_call(gw, args.method, body, pp or None, args.timeout)
+        if isinstance(res, str):
+            print(res)
+        else:
+            out(res)
     finally:
         gw.close()
+
+
+def raw_call(gw, method, body=None, path_params=None, timeout=30):
+    """Any gateway method: parsed JSON, or the text when the reply is not JSON."""
+    data = gw.request(method, path_params=path_params, body=body, query=None, timeout=timeout)
+    try:
+        return json.loads(data) if data else {}
+    except json.JSONDecodeError:
+        return data.decode("utf-8", "replace")
 
 
 # -- System Files (fs) ---------------------------------------------------------
@@ -1671,6 +1774,11 @@ def main(argv=None):
             p.add_argument("title")
         p.set_defaults(fn=cmd_session_op(kind))
     sub.add_parser("wake", help="request a VM wake").set_defaults(fn=cmd_wake)
+    p = sub.add_parser("stop", help="stop Muse's current turn (like the app's Stop button)")
+    p.add_argument("--thread", default=None, help="side chat session id (default: main chat)")
+    p.set_defaults(fn=cmd_stop)
+    from .tgbot import add_telegram_parser
+    add_telegram_parser(sub)
     sub.add_parser("update", help="upgrade this install to the latest release").set_defaults(fn=cmd_update)
     p = sub.add_parser("fs", help="browse/read/write Muse's System Files (agent home)")
     f = p.add_subparsers(dest="op", required=True)

@@ -140,6 +140,7 @@ echo "Full write-up: https://github.com/thoitiettxl-cyber/muse-cli#log-in-once"
 echo
 echo "Updates: in a terminal, $BIN_NAME notices a newer version on the fork's main once a day."
 echo "Upgrade with: $BIN_NAME update"
+echo "Telegram bot (run Muse from Telegram): $BIN_NAME telegram setup"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)

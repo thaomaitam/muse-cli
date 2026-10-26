@@ -268,6 +268,29 @@ Writes (`put`, `write`, `edit`, `mkdir`, `mv`, `rm`) change files Muse reads
 (MEMORY.md, SOUL.md, config/*). Confirm with the user before touching existing
 files; `rm` requires `--yes`.
 
+## Telegram bot
+
+Operate Muse from Telegram (chat with streamed replies, buttons for Muse's
+questions, photos/files into System Files `telegram-inbox/`, chats,
+approvals, fs, feed, goals, ideas, usage, profiles, update). One-time setup
+on the machine that runs it, after creating a bot with @BotFather:
+
+```bash
+muse-cli telegram setup             # token at a hidden prompt (or piped on stdin, never an argument);
+                                    # then send `/start CODE` to the bot to pair the owner
+muse-cli telegram install-service   # systemd unit, Restart=always (root; --user for a user unit)
+muse-cli telegram status            # config, allowed users, token check, service state
+muse-cli telegram run               # foreground instead of a service
+```
+
+Config is `telegram.json` (mode 600) in the active profile's folder; use
+`--profile NAME` before `telegram` for another login. Bot commands: /help
+/status /stop /chats /main /new /history /unread /rename /pin /unpin /archive
+/unarchive /delete /approvals /autoapprove /watch /files /fs /feed /goals
+/goal /ideas /usage /wake /profile /login /update /raw. Auto-approve is on by
+default in the bot (allow_always). `muse-cli stop [--thread ID]` stops
+Muse's current turn from the terminal (`chat.cancel`).
+
 ## Escape hatch
 
 `muse-cli raw <method> --body '{...}' [--param k=v]` calls any of the 258

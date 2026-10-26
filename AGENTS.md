@@ -4,6 +4,11 @@
 
 - `src/muse_cli/` is the package: `cli.py` (commands), `gateway.py` (auth,
   Noise transport), plus `routes.json` and `desc0.bin`/`desc1.bin` data files.
+- `tgbot.py` is `muse-cli telegram` (bot loop, commands, systemd unit) and
+  `tgapi.py` its Telegram Bot API client and formatting (curl_cffi, no bot
+  framework). Bot logic calls the data helpers in `cli.py` (`deliver`,
+  `run_wait`, `session_op`, `status_data`, ...), never the CLI's print paths.
+  Tests drive it with fakes in `tests/test_telegram.py`.
 - `pyproject.toml` holds all packaging metadata (hatchling). The version is
   read from `__version__` in `src/muse_cli/__init__.py`; that is the only
   place it lives.

@@ -487,12 +487,14 @@ class Gateway:
     # -- subscriptions (ndjson event streams) -------------------------------
     def subscribe_raw(self, method, path_params=None, body=None, query=None,
                       max_records=100, idle_timeout=10, overall_timeout=120,
-                      on_record=None):
+                      on_record=None, should_stop=None):
         """Open a subscription; returns list of raw record bytes.
 
         ``on_record`` is called with each record the moment it arrives, for
         callers that show events live instead of after the stream ends. If it
         returns a truthy value the subscription stops right there.
+        ``should_stop`` is polled about every 2 s, even while no records
+        arrive; a truthy value ends the subscription.
         """
         sid = self._open(method, path_params, body, query)
         buf, records = b"", []
@@ -512,6 +514,9 @@ class Gateway:
         halted = False
         try:
             while not halted and time.time() < deadline and len(records) < max_records:
+                if should_stop is not None and should_stop():
+                    halted = True
+                    break
                 try:
                     sf = q.get(timeout=2)
                 except queue_mod.Empty:
