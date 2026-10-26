@@ -422,6 +422,38 @@ class Turn:
         return self.stop_waiting
 
 
+# -- media Muse shows in the chat ----------------------------------------------------
+MEDIA_EVENTS = ("message.assistant", "delta.presentation")
+
+
+def media_from_events(events, after_seq=0, upto=None):
+    """[(seq, resource)] for files Muse showed after AFTER_SEQ (<= UPTO), oldest
+    first: image/video/audio/file presentations (delta.presentation, e.g. a
+    generated image) and sandbox files referenced by replies. One entry per path."""
+    out, seen = [], set()
+    for e in sorted(events, key=lambda e: e.get("seq") or 0):
+        seq = e.get("seq") or 0
+        if seq <= (after_seq or 0) or (upto is not None and seq > upto):
+            continue
+        if e.get("event_name") not in MEDIA_EVENTS:
+            continue
+        for r in cli.event_resources(e):
+            if r["path"] in seen:
+                continue
+            seen.add(r["path"])
+            out.append((seq, r))
+    return out
+
+
+def media_name(r):
+    return os.path.basename(str(r.get("path") or "").split("?")[0].rstrip("/")) or "file"
+
+
+def media_label(r):
+    label = str(r.get("label") or "").strip()
+    return label if label and label != media_name(r) else ""
+
+
 # -- the bot ----------------------------------------------------------------------
 class Bot:
     def __init__(self, api, muse=None, home=None, sync=False, clock=time.time):
@@ -454,6 +486,7 @@ class Bot:
         self.state.setdefault("watermarks", {})
         self.state.setdefault("auto_approve", True)   # the user's rule: never block Muse
         self.state.setdefault("watch", False)
+        self.state.setdefault("sent_media", [])
         prof = self.state.get("profile")
         if prof and prof != cli.PROFILE:
             try:
@@ -574,16 +607,60 @@ class Bot:
         except (TelegramError, ConnectionError) as e:
             log.debug("stream edit failed: %s", e)
 
-    def send_doc(self, chat_id, name, data, caption=None, markup=None):
-        kind = file_kind(name) if len(data) <= 10 * 1024 * 1024 else "document"
+    def send_doc(self, chat_id, name, data, caption=None, markup=None, mime=None):
+        kind = file_kind(name, mime, len(data))
         try:
             return self.api.send_file(chat_id, name, data, caption=caption, kind=kind,
                                       reply_markup=markup)
-        except TelegramError:
-            if kind == "photo":   # odd image formats: fall back to a document
+        except TelegramError as e:
+            if kind != "document":   # a format Telegram will not show inline: send the file
+                log.info("%s rejected for %s (%s); sending as a document", kind, name, e)
                 return self.api.send_file(chat_id, name, data, caption=caption, kind="document",
                                           reply_markup=markup)
             raise
+
+    def media_key(self, chat_id, session_id, seq, r):
+        return f"{self.profile}|{chat_id}|{session_id or MAIN}|{seq}|{r.get('path')}"
+
+    def media_sent(self, chat_id, session_id, seq, r):
+        return self.media_key(chat_id, session_id, seq, r) in self.state.get("sent_media", [])
+
+    def send_media(self, chat_id, session_id, seq, r, prefix=""):
+        """Download one file Muse showed and send it (photo/video/audio/document).
+        Each (chat, session, seq, path) is sent once, whichever path (turn or
+        background monitor) gets there first. A failure becomes a short notice."""
+        key = self.media_key(chat_id, session_id, seq, r)
+        with self.lock:
+            sent = self.state.setdefault("sent_media", [])
+            if key in sent:
+                return False
+            sent.append(key)
+            del sent[:-500]
+            self.save_state()
+        name, label = media_name(r), media_label(r)
+        caption = (prefix + label).strip() or None
+        what = label or name
+        if (r.get("byte_len") or 0) > UPLOAD_LIMIT:
+            self.send(chat_id, f"📎 {esc(prefix)}<b>{esc(what)}</b> is {r['byte_len'] // (1024 * 1024)} MB, "
+                               f"too big for Telegram. Get it with <code>muse-cli download</code>.")
+            return True
+        try:
+            with self.muse.gw() as g:
+                data = g.download_file(r)
+        except Exception as e:  # noqa: BLE001
+            log.warning("media download failed seq=%s %s: %s", seq, name, str(e)[:200])
+            self.send(chat_id, f"📎 {esc(prefix)}Muse showed <b>{esc(what)}</b>, but I could not fetch it "
+                               f"({esc(type(e).__name__)}). /files lists it for a retry.")
+            return True
+        try:
+            self.send_doc(chat_id, name, data, caption=caption, mime=r.get("mime"))
+            log.info("media sent chat=%s seq=%s kind=%s bytes=%d", chat_id, seq,
+                     file_kind(name, r.get("mime"), len(data)), len(data))
+        except Exception as e:  # noqa: BLE001
+            log.warning("media send failed seq=%s %s: %s", seq, name, str(e)[:200])
+            self.send(chat_id, f"📎 {esc(prefix)}could not send <b>{esc(what)}</b> to Telegram "
+                               f"({esc(str(e)[:150])}).")
+        return True
 
     def reply_long(self, chat_id, text, stem="output", pre=False, markup=None):
         """Short output as a message (<pre> when pre), long output as a file."""
@@ -919,10 +996,20 @@ class Bot:
                              "Muse's replies when they arrive.")
         for e in res.get("auto_approve_errors") or []:
             notes.append(f"⚠️ could not auto-approve {e.get('approval_id')}: {e.get('error')}")
-        body = text or ("(no reply text)" if outcome in ("done", "needs_input") else "")
-        full = (body + ("\n\n" if body and notes else "") + "\n".join(notes)).strip() or "(done)"
-        self.deliver_reply(chat_id, turn.msg_id, full, markup, stem=f"muse-reply-{turn.user_seq}")
-        self.after_turn(turn)
+        evs = self.turn_history(turn)
+        media = [(q, r) for q, r in media_from_events(evs, turn.user_seq or 0)
+                 if not self.media_sent(chat_id, turn.session_id, q, r)]
+        if len(media) > MAX_FILES_PER_TURN:
+            notes.append(f"📎 {len(media) - MAX_FILES_PER_TURN} more file(s): see /files")
+            media = media[:MAX_FILES_PER_TURN]
+        stem = f"muse-reply-{turn.user_seq}"
+        if not media:
+            body = text or ("(no reply text)" if outcome in ("done", "needs_input") else "")
+            full = (body + ("\n\n" if body and notes else "") + "\n".join(notes)).strip() or "(done)"
+            self.deliver_reply(chat_id, turn.msg_id, full, markup, stem=stem)
+        else:
+            self.deliver_interleaved(turn, res.get("replies") or [], media, notes, markup, stem)
+        self.after_turn(turn, evs)
         elapsed = self.clock() - turn.started
         if elapsed >= LONG_TURN and outcome in ("done", "needs_input", "needs_approval", "failed"):
             icon = {"done": "✅", "failed": "⚠️"}.get(outcome, "❓")
@@ -931,6 +1018,50 @@ class Bot:
                               text=f"{icon} Muse finished ({fmt_secs(elapsed)}).")
             except Exception:  # noqa: BLE001
                 pass
+
+    def turn_history(self, turn):
+        try:
+            return self.muse.history(turn.session_id, 40)
+        except Exception as e:  # noqa: BLE001
+            log.debug("turn history: %s", e)
+            return []
+
+    def deliver_interleaved(self, turn, replies, media, notes, markup, stem):
+        """Text replies and media in Muse's order: text before an image goes in
+        the streamed message, the image follows, later text after it."""
+        chat_id = turn.chat_id
+        items = sorted([(r.get("seq") or 0, 0, "text", r["text"]) for r in replies if r.get("text")]
+                       + [(q, 1, "media", r) for q, r in media], key=lambda x: (x[0], x[1]))
+        segs = []
+        for _q, _o, kind, val in items:
+            if kind == "text" and segs and segs[-1][0] == "text":
+                segs[-1] = ("text", segs[-1][1] + "\n\n" + val)
+            else:
+                segs.append((kind, val if kind == "text" else (_q, val)))
+        tail = "\n".join(notes)
+        first = [True]
+
+        def put(t, mk=None):
+            if first[0]:
+                first[0] = False
+                self.deliver_reply(chat_id, turn.msg_id, t, mk, stem=stem)
+            elif needs_document(t):
+                self.send_doc(chat_id, doc_name(stem, t), t.encode(), caption="Muse's full reply", markup=mk)
+            else:
+                self.send_md(chat_id, t, mk)
+
+        for i, (kind, val) in enumerate(segs):
+            last = i == len(segs) - 1
+            if kind == "text":
+                put((val + ("\n\n" + tail if last and tail else "")).strip(), markup if last else None)
+                continue
+            q, r = val
+            if first[0]:        # media first: the streamed message becomes its heading
+                first[0] = False
+                self.edit(chat_id, turn.msg_id, "🖼 " + (media_label(r) or media_name(r)), html=False)
+            self.send_media(chat_id, turn.session_id, q, r)
+            if last and (tail or markup):
+                put(tail or "⬆️", markup)
 
     def deliver_reply(self, chat_id, msg_id, text, markup=None, stem="muse-reply"):
         if needs_document(text):
@@ -944,34 +1075,12 @@ class Bot:
         for i, piece in enumerate(pieces[1:], 1):
             self.send_md(chat_id, piece, markup if i == len(pieces) - 1 else None)
 
-    def after_turn(self, turn):
-        """Send files the turn produced; move the background watermark past it."""
-        try:
-            evs = self.muse.history(turn.session_id, 30)
-        except Exception as e:  # noqa: BLE001
-            log.debug("after_turn history: %s", e)
-            return
+    def after_turn(self, turn, evs=None):
+        """Move the background watermark past the turn (its files went out
+        with the reply, in order; see finish_turn)."""
+        if evs is None:
+            evs = self.turn_history(turn)
         self.set_watermark(turn.session_id, max((e.get("seq") or 0 for e in evs), default=None))
-        seen, sent = set(), 0
-        for e in evs:
-            if (e.get("seq") or 0) <= (turn.user_seq or 0) or e.get("event_name") != "message.assistant":
-                continue
-            for r in cli.event_resources(e):
-                if r["path"] in seen or sent >= MAX_FILES_PER_TURN:
-                    continue
-                seen.add(r["path"])
-                if (r.get("byte_len") or 0) > UPLOAD_LIMIT:
-                    self.send(turn.chat_id, f"📎 <code>{esc(r['path'])}</code> is too big for Telegram; "
-                                            "use muse-cli download.")
-                    continue
-                try:
-                    with self.muse.gw() as g:
-                        data = g.download_file(r)
-                    self.send_doc(turn.chat_id, os.path.basename(r["path"].split("?")[0]) or "file", data)
-                    sent += 1
-                except Exception as ex:  # noqa: BLE001
-                    self.send(turn.chat_id, f"📎 could not fetch <code>{esc(r['path'])}</code>: "
-                                            f"{esc(str(ex)[:200])}")
 
     # -- approvals ----------------------------------------------------------------
     def approve_forever(self, items):
@@ -1666,8 +1775,9 @@ class Bot:
         if writing:                 # still being written: pick it up once complete
             top = min(e.get("seq") or 0 for e in writing) - 1
             new = [e for e in new if (e.get("seq") or 0) <= top]
+        media = media_from_events(evs, wm, top)
         self.set_watermark(session_id, top)
-        if not new:
+        if not new and not media:
             return
         chats = self.state["chats"].get(self.profile, {})
         targets = [int(c) for c, st in chats.items() if st.get("session_id") == session_id]
@@ -1677,10 +1787,16 @@ class Bot:
         if session_id:
             title = next((st.get("title") for st in chats.values()
                           if st.get("session_id") == session_id and st.get("title")), "side chat")
-        for e in new:
-            text = clean_text(ev_text(e))
+        items = sorted([(e.get("seq") or 0, 0, "text", e) for e in new]
+                       + [(q, 1, "media", r) for q, r in media], key=lambda x: (x[0], x[1]))
+        for seq, _o, kind, val in items:
             for chat_id in targets:
                 here = self.chat_state(chat_id)["session_id"] == session_id
+                if kind == "media":
+                    self.send_media(chat_id, session_id, seq, val,
+                                    prefix="" if here else f"Muse · {title}: ")
+                    continue
+                text = clean_text(ev_text(val))
                 markup = None if here else keyboard([[button("Open this chat",
                                                              self.cb("open", session_id, title))]])
                 self.send_md(chat_id, f"💬 Muse · {title}:\n\n{text}", markup)
@@ -1811,7 +1927,8 @@ class Monitor(threading.Thread):
             except Exception as e:  # noqa: BLE001
                 log.warning("approvals: %s", e)
         status = str(_payload(ev).get("status") or "").lower()
-        if (name.startswith("message.") or name in ("delta.message_done", "sessions.updated")
+        if (name.startswith("message.") or name in ("delta.message_done", "delta.presentation",
+                                                     "sessions.updated")
                 or (name == "task.status" and status and status != "running")):
             self.dirty_at = self.dirty_at or time.time()
         self.bot.watch_event(ev)

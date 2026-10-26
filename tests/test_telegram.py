@@ -110,6 +110,8 @@ class Server:
         self.idea_execs = []
         self.ops = []
         self.subscribes = 0
+        self.downloads = []
+        self.download_error = False
         self.idle_cap = 30           # how long an "IDLE" stream stays open at most
 
     def next_seq(self):
@@ -224,7 +226,12 @@ class FakeGateway:
         return []
 
     def download_file(self, ref, timeout=300):
-        return b"FILE:" + str(ref.get("path") if isinstance(ref, dict) else ref).encode()
+        path = str(ref.get("path") if isinstance(ref, dict) else ref)
+        self.s.downloads.append(path)
+        if self.s.download_error:
+            from muse_cli.gateway import GatewayError
+            raise GatewayError(404, "media.raw -> 404")
+        return b"FILE:" + path.encode()
 
     def close(self):
         pass
@@ -1146,3 +1153,151 @@ def test_upload_failure_is_reported_not_silent(env):
     env.bot.handle_update(msg(document={"file_id": "F9", "file_name": "big.bin"}))
     assert "Upload to System Files failed" in env.tg.sent()[-1]["text"]
     assert not env.s.sent_texts
+
+
+# -- media Muse shows (delta.presentation), e.g. a generated image ------------------------------
+DUCK = "sandbox://workspace/imagine_media/media-generation-duck-0-abc.webp"
+
+
+def presentation(server, sid, path=DUCK, label="Ảnh vịt con", mime="image/webp", kind="image",
+                 byte_len=549408):
+    """Add a delta.presentation like the real seq 4647 one."""
+    seq = server.next_seq()
+    key = {"image": "images", "video": "videos", "audio": "audios"}.get(kind, "files")
+    e = {"seq": seq, "event_name": "delta.presentation", "payload": {
+        "kind": kind, "display_text": label, "image_path": path.replace("sandbox://", ""),
+        "fallback_text": f"![{label}]({path})\n",
+        "data": {"fallback_text": f"![{label}]({path})\n", key: [{
+            "byte_len": byte_len, "label": label, "mime": mime, "missing": False, "path": path,
+            "variants": {"original": "https://vm.metaaivm.com/media/raw/" + path.replace("sandbox://", "")}}]}}}
+    server.events.setdefault(sid, []).append(e)
+    return e
+
+
+def image_turn_script(env, before="Xong rồi, ảnh vịt con đây.", after="Một chú vịt con."):
+    def script(sid):
+        def finish():
+            env.s.add(sid, "message.assistant", before)
+            presentation(env.s, sid)
+            env.s.add(sid, "message.assistant", after)
+        return [ts("completed"), ts("running"), finish, ts("completed")]
+    return script
+
+
+def test_turn_with_image_presentation_sends_photo_once_in_order(env):
+    env.s.script = image_turn_script(env)
+    env.bot.handle_update(msg("Tạo ảnh con vịt bằng muse"))
+    photos = [d for d in env.tg.docs if d["kind"] == "photo"]
+    assert len(photos) == 1
+    p = photos[0]
+    assert p["name"].endswith(".webp") and p["caption"] == "Ảnh vịt con"
+    assert p["data"] == b"FILE:" + DUCK.encode()
+    # order: text before the image (the streamed message), the photo, then the text after it
+    edits = env.tg.sent("editMessageText")
+    assert edits[-1]["text"] == "Xong rồi, ảnh vịt con đây."
+    after = [c for c in env.tg.calls if c[0] == "sendMessage" and "Một chú vịt con" in c[1]["text"]]
+    assert after and env.tg.calls.index(after[0]) > 0
+    # nothing is sent again: the monitor sees the same events later
+    env.bot.check_background(env.bot.chat_state(OWNER)["session_id"])
+    env.bot.check_background(None)
+    assert len([d for d in env.tg.docs if d["kind"] == "photo"]) == 1
+    assert env.s.downloads == [DUCK]
+
+
+def test_photo_sent_between_texts_order(env):
+    order = []
+    orig_send_file = env.tg.send_file
+
+    def send_file(*a, **kw):
+        order.append("photo")
+        return orig_send_file(*a, **kw)
+    orig_call = env.tg.call
+
+    def call(method, **p):
+        if method == "sendMessage" and "Một chú" in (p.get("text") or ""):
+            order.append("after")
+        if method == "editMessageText" and p.get("text") == "Xong rồi, ảnh vịt con đây.":
+            order.append("before")
+        return orig_call(method, **p)
+    env.tg.send_file, env.tg.call = send_file, call
+    env.s.script = image_turn_script(env)
+    env.bot.handle_update(msg("duck"))
+    assert order == ["before", "photo", "after"]
+
+
+def test_image_only_turn_and_question_buttons_after_it(env):
+    def script(sid):
+        def finish():
+            presentation(env.s, sid)
+            env.s.add(sid, "message.assistant", "Bạn có muốn thêm một ảnh nữa không?")
+        return [ts("completed"), ts("running"), finish, ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("duck"))
+    assert len(env.tg.docs) == 1
+    assert env.tg.texts()[-1].startswith("Bạn có muốn") and "Muse is asking" in env.tg.texts()[-1]
+    assert env.tg.buttons()
+
+
+def test_monitor_forwards_background_image_once(env):
+    env.bot.check_background(None)                       # first look: watermark only
+    env.s.add(None, "message.assistant", "Here is your daily picture")
+    presentation(env.s, None, path="sandbox://workspace/imagine_media/daily.webp", label="Daily")
+    env.bot.check_background(None)
+    assert "daily picture" in env.tg.sent()[-1]["text"]
+    assert [d["name"] for d in env.tg.docs] == ["daily.webp"] and env.tg.docs[0]["kind"] == "photo"
+    env.bot.check_background(None)
+    assert len(env.tg.docs) == 1 and len(env.s.downloads) == 1
+
+
+def test_media_download_failure_sends_a_notice(env):
+    env.s.download_error = True
+    env.s.script = image_turn_script(env)
+    env.bot.handle_update(msg("duck"))
+    assert not env.tg.docs
+    notice = [t for t in env.tg.texts() if t and "could not fetch" in t]
+    assert len(notice) == 1 and "Ảnh vịt con" in notice[0]
+    assert "Một chú vịt con" in env.tg.texts()[-1]          # the turn still finishes
+
+
+def test_monitor_download_failure_notice_once(env):
+    env.s.download_error = True
+    env.bot.check_background(None)
+    presentation(env.s, None, label="Report chart", path="sandbox://workspace/c.png", mime="image/png")
+    env.bot.check_background(None)
+    env.bot.check_background(None)
+    assert sum("could not fetch" in (t or "") for t in env.tg.texts()) == 1
+
+
+def test_media_kinds_and_size_limits(env):
+    from muse_cli.tgapi import file_kind
+    assert file_kind("a.webp", "image/webp", 500) == "photo"
+    assert file_kind("a.webp", "image/webp", 11 * 1024 * 1024) == "document"
+    assert file_kind("v.mp4", "video/mp4") == "video"
+    assert file_kind("s.mp3", "audio/mpeg") == "audio"
+    assert file_kind("x.gif", "image/gif") == "document"
+    assert file_kind("r.pdf") == "document"
+    env.bot.check_background(None)
+    presentation(env.s, None, path="sandbox://workspace/big.mp4", label="Big video", mime="video/mp4",
+                 kind="video", byte_len=80 * 1024 * 1024)
+    presentation(env.s, None, path="sandbox://workspace/clip.mp4", label="Clip", mime="video/mp4",
+                 kind="video", byte_len=1000)
+    env.bot.check_background(None)
+    assert any("too big for Telegram" in (t or "") and "Big video" in t for t in env.tg.texts())
+    assert [(d["name"], d["kind"]) for d in env.tg.docs] == [("clip.mp4", "video")]
+
+
+def test_rejected_photo_falls_back_to_document(env):
+    def send_file(chat_id, filename, data, caption=None, kind="document", **params):
+        if kind == "photo":
+            raise TelegramError("sendPhoto", 400, "Bad Request: IMAGE_PROCESS_FAILED")
+        env.tg.docs.append({"name": filename, "kind": kind, "caption": caption})
+        return {"message_id": 1}
+    env.tg.send_file = send_file
+    env.s.script = image_turn_script(env)
+    env.bot.handle_update(msg("duck"))
+    assert [(d["name"].endswith(".webp"), d["kind"]) for d in env.tg.docs] == [(True, "document")]
+
+
+def test_multipart_uses_real_content_type():
+    body, _ = tgapi.multipart({"chat_id": 1}, "photo", "duck.webp", b"RIFF")
+    assert b"Content-Type: image/webp" in body

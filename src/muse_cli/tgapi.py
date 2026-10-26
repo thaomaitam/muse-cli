@@ -17,6 +17,9 @@ CHUNK = 3800            # what we put in one message (room for markup)
 CAPTION_LIMIT = 1024
 UPLOAD_LIMIT = 49 * 1024 * 1024    # bots may send up to 50 MB
 DOWNLOAD_LIMIT = 20 * 1024 * 1024  # bots may fetch up to 20 MB
+PHOTO_LIMIT = 10 * 1024 * 1024     # sendPhoto takes photos up to 10 MB
+SEND_METHODS = {"document": "sendDocument", "photo": "sendPhoto", "video": "sendVideo",
+                "audio": "sendAudio"}
 
 
 class TelegramError(RuntimeError):
@@ -93,8 +96,8 @@ class TelegramAPI:
                 raise
 
     def send_file(self, chat_id, filename, data, caption=None, kind="document", **params):
-        """sendDocument / sendPhoto with an in-memory file (multipart)."""
-        method = {"document": "sendDocument", "photo": "sendPhoto"}[kind]
+        """sendDocument / sendPhoto / sendVideo / sendAudio with an in-memory file (multipart)."""
+        method = SEND_METHODS[kind]
         fields = {"chat_id": chat_id, "caption": (caption or "")[:CAPTION_LIMIT] or None, **params}
         body, ctype = multipart({k: v for k, v in fields.items() if v is not None},
                                 kind, filename, data)
@@ -115,6 +118,12 @@ class TelegramAPI:
         return r.content, f.get("file_path")
 
 
+def _ctype(filename):
+    import mimetypes
+    mimetypes.add_type("image/webp", ".webp")
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
 def multipart(fields, file_field, filename, data):
     boundary = "----muse" + uuid.uuid4().hex
     parts = []
@@ -125,7 +134,7 @@ def multipart(fields, file_field, filename, data):
                       f"{v}\r\n").encode())
     safe = re.sub(r'[\r\n"]', "_", filename) or "file"
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
-                  f'filename="{safe}"\r\nContent-Type: application/octet-stream\r\n\r\n').encode()
+                  f'filename="{safe}"\r\nContent-Type: {_ctype(filename)}\r\n\r\n').encode()
                  + data + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
@@ -225,6 +234,14 @@ def doc_name(stem, text):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-")[:40] + ext
 
 
-def file_kind(name):
+def file_kind(name, mime=None, size=None):
+    """How Telegram should get a file: photo, video, audio or document."""
     ext = os.path.splitext(name.lower())[1]
-    return "photo" if ext in (".jpg", ".jpeg", ".png", ".webp") else "document"
+    m = (mime or "").lower()
+    if m in ("image/jpeg", "image/png", "image/webp") or (not m and ext in (".jpg", ".jpeg", ".png", ".webp")):
+        return "photo" if size is None or size <= PHOTO_LIMIT else "document"
+    if m.startswith("video/") or (not m and ext in (".mp4", ".mov", ".m4v")):
+        return "video"
+    if m.startswith("audio/") or (not m and ext in (".mp3", ".m4a", ".ogg", ".oga", ".wav", ".flac")):
+        return "audio"
+    return "document"

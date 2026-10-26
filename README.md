@@ -294,7 +294,7 @@ message, long replies are split, and very long ones or big code blocks arrive
 as a `.md`/`.txt` file. When Muse asks something, its options (or Yes / No /
 Go ahead) show up as buttons; tap one or just type the answer. Photos and
 files you send are saved to System Files under `telegram-inbox/` and Muse is
-told the path (with your caption). Files Muse makes are sent back. Messages
+told the path (with your caption). Files Muse makes or shows (generated images, videos, audio, other files) are sent back in order with the text: images as photos, videos/audio as playable media, the rest as documents. Messages
 sent while Muse is busy are queued; before saying so, the bot re-checks Muse's
 real state on the server and sends right away if Muse is idle. A turn whose
 live stream goes quiet (or says Muse is idle without a turn end) is re-checked
