@@ -1792,8 +1792,10 @@ def pair(api, code, timeout=600, out=print, sleep=time.sleep):
         for u in ups or []:
             offset = u["update_id"] + 1
             m = u.get("message") or {}
+            # Accept the code anywhere as its own word ("/start CODE", just "CODE",
+            # or a paste that also carries the t.me link), private chats only.
             words = (m.get("text") or "").split()
-            if len(words) == 2 and words[0].split("@")[0] == "/start" and words[1] == code:
+            if (m.get("chat") or {}).get("type", "private") == "private" and code in words:
                 uid = m["from"]["id"]
                 try:
                     api.call("sendMessage", chat_id=m["chat"]["id"],

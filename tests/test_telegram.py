@@ -797,3 +797,30 @@ def test_cli_stop_calls_chat_cancel(home, monkeypatch, capsys):
     cli.main(["stop", "--thread", "T1"])
     assert server.cancels == [{"session_id": "T1"}]
     assert json.loads(capsys.readouterr().out) == {"cancelled": True}
+
+
+def _pair_with(msgs, code="530029"):
+    tg = FakeTelegram()
+    batches = [[{"update_id": i + 1, "message": m} for i, m in enumerate(msgs)]]
+
+    def call(method, **p):
+        tg.calls.append((method, p))
+        if method == "getUpdates":
+            return batches.pop(0) if p.get("offset") != -1 and batches else []
+        return {"message_id": 1}
+    tg.call = call
+    return tgbot.pair(tg, code, timeout=1, sleep=lambda s: None)
+
+
+def test_pairing_accepts_pasted_link_and_bare_code():
+    pasted = {"text": "https://t.me/musecli_bot\n/start 530029", "from": {"id": 7},
+              "chat": {"id": 7, "type": "private"}}
+    assert _pair_with([pasted]) == 7
+    bare = {"text": "530029", "from": {"id": 8}, "chat": {"id": 8, "type": "private"}}
+    assert _pair_with([bare]) == 8
+
+
+def test_pairing_rejects_groups_and_partial_codes():
+    group = {"text": "/start 530029", "from": {"id": 7}, "chat": {"id": -1, "type": "group"}}
+    partial = {"text": "/start 5300291", "from": {"id": 8}, "chat": {"id": 8, "type": "private"}}
+    assert _pair_with([group, partial]) is None
