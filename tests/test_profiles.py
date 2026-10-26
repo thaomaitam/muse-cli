@@ -141,12 +141,12 @@ def test_prescan_only_reads_flag_before_subcommand():
 
 
 # -- slug validation ---------------------------------------------------------------
-@pytest.mark.parametrize("name", ["work", "a", "A-b_9", "x" * 64, "default"])
+@pytest.mark.parametrize("name", ["work", "a", "A-b_9", "x" * 64, "default", "no.0", "a.b.c"])
 def test_valid_names(name):
     assert cli.validate_profile_name(name) == name
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "../x", "a/b", "/abs", "a b", "work.",
+@pytest.mark.parametrize("name", ["", ".", "..", "../x", "a/b", "/abs", "a b", "work.", ".hidden", "...",
                                   "x" * 65, "é", "a\\b", "~", "a\nb", None])
 def test_invalid_names(name):
     with pytest.raises(ValueError):

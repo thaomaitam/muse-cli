@@ -26,7 +26,7 @@ from .update import cmd_update, finish_update_check, start_update_check
 # at ~/.config/muse-cli/profiles/NAME/ with its own copies of those files.
 DEFAULT_PROFILE = "default"
 PROFILE_ENV = "MUSE_CLI_PROFILE"
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_PROFILE_RE = re.compile(r"^(?!\.)[A-Za-z0-9._-]{1,64}(?<!\.)$")
 
 
 def base_config_dir():
@@ -35,10 +35,10 @@ def base_config_dir():
 
 
 def validate_profile_name(name):
-    """Return NAME if it is a safe slug ([A-Za-z0-9_-], 1-64 chars), else raise ValueError."""
+    """Return NAME if it is a safe slug ([A-Za-z0-9._-], 1-64 chars, no leading/trailing '.'), else raise ValueError."""
     if not isinstance(name, str) or not _PROFILE_RE.match(name):
         raise ValueError(
-            f"invalid profile name {name!r}: use 1-64 letters, digits, '-' or '_'")
+            f"invalid profile name {name!r}: use 1-64 letters, digits, '.', '-' or '_' (not starting or ending with '.')")
     return name
 
 

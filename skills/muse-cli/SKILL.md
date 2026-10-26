@@ -230,7 +230,7 @@ Every command reads one profile: its cookies, config (auto-approve etc.) and
 chat state. With no flag and no env var it is `default`, the original
 `~/.config/muse-cli/` (the user's main Muse; never move or edit its files by
 hand). A named profile is `~/.config/muse-cli/profiles/NAME/` (folder 700,
-cookies 600). Names: letters, digits, `-`, `_`.
+cookies 600). Names: letters, digits, `.`, `-`, `_` (no leading/trailing `.`).
 
 ```bash
 muse-cli auth list                       # offline: profiles, active one (*), cookies or not

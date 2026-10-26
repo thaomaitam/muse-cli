@@ -231,7 +231,7 @@ Keep more than one muse.ai login side by side. Each profile has its own
 - `default` (no flag, no env var) is the original location,
   `~/.config/muse-cli/`. Nothing there moves.
 - A named profile lives in `~/.config/muse-cli/profiles/NAME/` (folder mode
-  700, cookies mode 600). Names are letters, digits, `-` and `_`.
+  700, cookies mode 600). Names are letters, digits, `.`, `-` and `_`, not starting or ending with `.`.
 - Pick one with `--profile NAME` before the command, or `MUSE_CLI_PROFILE=NAME`.
   The flag wins over the env var. A new profile starts with fresh-install
   defaults (auto-approve off).
