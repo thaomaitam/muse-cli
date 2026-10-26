@@ -1301,3 +1301,134 @@ def test_rejected_photo_falls_back_to_document(env):
 def test_multipart_uses_real_content_type():
     body, _ = tgapi.multipart({"chat_id": 1}, "photo", "duck.webp", b"RIFF")
     assert b"Content-Type: image/webp" in body
+
+
+# -- live status like the Muse app; no "Muse finished" ping -----------------------------------------
+def _agent_status(text, emoji=None, code="working"):
+    p = {"activity_code": code, "activity_text": text, "agent_id": "r", "is_thread": False,
+         "message_id": "x"}
+    if emoji:
+        p["activity_emoji"] = emoji
+    return json.dumps({"event": "agent.status", "payload": p})
+
+
+def test_app_status_with_emoji_is_shown_live(env):
+    """Real agent.status from the app: activity_emoji 🦆 + activity_text."""
+    env.s.script = lambda sid: [
+        ts("completed"), ts("running"), _agent_status("is working"),
+        _agent_status("Updating plan", "🦆"),
+        json.dumps({"event": "delta.tool_start", "payload": {"tool_name": "plan_update"}}),
+        _agent_status("Creating image", "🎨"),
+        lambda: env.s.add(None, "message.assistant", "pong"), ts("completed")]
+    env.bot.handle_update(msg("go"))
+    texts = env.tg.texts()
+    assert any(t.startswith("⏳ Muse is working · ") for t in texts)
+    assert any(t.startswith("🦆 Updating plan · ") for t in texts)
+    assert any(t.startswith("🎨 Creating image · ") for t in texts)
+    # the app's status wins over our derived tool label
+    assert not any(t.startswith("🔧") for t in texts)
+    assert env.tg.sent("editMessageText")[-1]["text"] == "pong"
+
+
+def test_tool_label_is_the_fallback_without_app_status(env):
+    env.s.script = lambda sid: [
+        ts("completed"), ts("running"),
+        json.dumps({"event": "delta.tool_start", "payload": {"tool_name": "web_search"}}),
+        lambda: env.s.add(None, "message.assistant", "done"), ts("completed")]
+    env.bot.handle_update(msg("go"))
+    assert any((t or "").startswith("🔧 web_search") for t in env.tg.texts())
+
+
+def test_app_status_helper():
+    assert tgbot.app_status({"activity_code": "working", "activity_emoji": "🦆",
+                             "activity_text": "Planning ducks"}) == "🦆 Planning ducks"
+    assert tgbot.app_status({"activity_code": "responding", "activity_text": "is responding"}) \
+        == "⏳ Muse is responding"
+    assert tgbot.app_status({"activity_code": "online", "activity_text": "online"}) == "⏳ Muse is wrapping up…"
+    assert tgbot.app_status({"activity_code": "working"}) is None
+
+
+def test_no_muse_finished_ping_after_long_turn(env):
+    clock = [1000.0]
+    env.bot.clock = lambda: clock[0]
+
+    def script(sid):
+        def slow():
+            clock[0] += 600                    # a 10-minute turn
+            env.s.add(sid, "message.assistant", "all done")
+        return [ts("completed"), ts("running"), slow, ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("long job"))
+    assert not any("Muse finished" in (t or "") for t in env.tg.texts())
+    assert env.tg.sent("editMessageText")[-1]["text"] == "all done"
+    assert len(env.tg.sent()) == 1                 # only the bubble that became the reply
+
+
+def _last_text_of(tg, mid):
+    return tg.messages[mid].get("text")
+
+
+def test_no_stale_status_bubble(env):
+    env.s.script = lambda sid: [ts("completed"), ts("running"), _agent_status("Thinking", "🤔"),
+                                lambda: env.s.add(None, "message.assistant", "answer"), ts("completed")]
+    env.bot.handle_update(msg("q"))
+    assert env.tg.sent()[0]["text"] == "⏳ Sending to Muse…"
+    assert len(env.tg.messages) == 1               # one bubble, no extra status/ping messages
+    (mid,) = env.tg.messages
+    assert _last_text_of(env.tg, mid) == "answer"
+
+
+def test_image_first_turn_deletes_the_status_bubble(env):
+    def script(sid):
+        def finish():
+            presentation(env.s, sid)
+        return [ts("completed"), ts("running"), _agent_status("Creating image", "🎨"), finish,
+                ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("duck"))
+    deleted = [p for m, p in env.tg.calls if m == "deleteMessage"]
+    bubble_id = min(env.tg.messages)          # the "⏳ Sending to Muse…" bubble
+    assert len(deleted) == 1 and deleted[0]["message_id"] == bubble_id
+    assert [d["kind"] for d in env.tg.docs] == ["photo"]
+
+
+def test_streaming_edit_cannot_land_after_the_final_reply(env):
+    """A ticker edit racing the final edit must not overwrite the reply with a ⏳ status."""
+    import threading
+    t = tgbot.Turn(env.bot, OWNER, None, "main")
+    t.msg_id = 5
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def slow_edit(chat_id, mid, text):
+        calls.append(text)
+        entered.set()
+        release.wait(2)
+    env.bot.edit_plain = slow_edit
+    t.dirty = True
+    th = threading.Thread(target=t.maybe_edit, kwargs={"force": True})
+    th.start()
+    entered.wait(2)
+    done = []
+    fin = threading.Thread(target=lambda: (t.finish(), done.append(1)))
+    fin.start()
+    fin.join(0.2)
+    assert not done                       # finish() waits for the in-flight edit
+    release.set()
+    th.join(2)
+    fin.join(2)
+    assert done and t.finished
+    t.dirty = True
+    t.maybe_edit(force=True)              # nothing after finish
+    assert len(calls) == 1
+
+
+def test_replayed_online_before_the_turn_is_not_shown(env):
+    online = json.dumps({"event": "agent.status", "payload": {"activity_code": "online",
+                                                              "activity_text": "online"}})
+    env.s.script = lambda sid: [online, ts("completed"), ts("running"), _agent_status("Planning ducks", "🦆"),
+                                lambda: env.s.add(None, "message.assistant", "ok"), ts("completed")]
+    env.bot.handle_update(msg("go"))
+    statuses = [t for t in env.tg.texts() if " · " in (t or "")]
+    assert statuses and not any("wrapping up" in t for t in statuses[:1])
+    assert any(t.startswith("🦆 Planning ducks") for t in statuses)

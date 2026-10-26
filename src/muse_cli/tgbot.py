@@ -46,7 +46,6 @@ CONFIG_NAME = "telegram.json"
 STATE_NAME = "telegram-state.json"
 INBOX = "telegram-inbox"
 EDIT_INTERVAL = 1.0          # seconds between edits of a streaming reply
-LONG_TURN = 60               # turns longer than this get a separate "done" ping
 TURN_TIMEOUT = 6 * 3600      # how long one turn is followed before handing off
 POLL_FALLBACK = 3.0          # history poll when no live deltas arrive (side chats)
 WATCH_FLUSH = 3.0            # /watch batches events at most this often
@@ -300,11 +299,21 @@ def status_from_event(ev):
         tool = _tool_name(p)
         return f"🔧 {tool}" if tool else "🔧 using a tool"
     if name == "agent.status":
-        if p.get("activity_code") == "online":
-            return "⏳ Muse is wrapping up…"     # idle; the turn end is being confirmed
-        t = p.get("activity_text") or p.get("status_text")
-        return f"⏳ {_activity(t)[:120]}" if t else None
+        return app_status(p)
     return None
+
+
+def app_status(p):
+    """The live status line the Muse app shows under the agent's name, from an
+    agent.status payload: activity_emoji + activity_text (e.g. "🦆 Planning
+    ducks"); generic ones ("is working") get ⏳ and a subject."""
+    if p.get("activity_code") == "online":
+        return "⏳ Muse is wrapping up…"     # idle; the turn end is being confirmed
+    t = str(p.get("activity_text") or p.get("status_text") or "").strip()
+    if not t:
+        return None
+    emoji = str(p.get("activity_emoji") or "").strip()[:8]
+    return f"{emoji or '⏳'} {_activity(t)[:120]}"
 
 
 def short(text, n=24):
@@ -340,7 +349,10 @@ class Turn:
         self.stop_waiting = False
         self.finished = False
         self.recheck_requested = False
+        self.app_status = None    # the Muse app's live status line, preferred over our labels
+        self.seen_work = False
         self.lock = threading.Lock()
+        self.edit_lock = threading.Lock()   # no streaming edit can land after the final one
 
     def take_recheck(self):
         """run_wait polls this: True once after someone asked to re-check the server."""
@@ -375,8 +387,17 @@ class Turn:
                     self.parts[key] = full
                     self.dirty = True
                 self.last_delta = self.bot.clock()
-            else:
+            elif not self.cancel_requested:
                 st = status_from_event(ev)
+                online = name == "agent.status" and p.get("activity_code") == "online"
+                if name == "agent.status" and st and not online:
+                    self.seen_work = True
+                if online and not self.seen_work:
+                    st = None     # the replayed idle state from before this turn started
+                if name == "agent.status" and st:
+                    self.app_status = st
+                elif self.app_status and not name.startswith("approvals"):
+                    st = None     # the app's own status wins over derived tool labels
                 if st and st != self.status:
                     self.status = st
                     self.dirty = True
@@ -410,13 +431,21 @@ class Turn:
         now = self.bot.clock()
         if not force and (not self.dirty or now - self.last_edit < self.bot.edit_interval):
             return
-        text = self.render()
-        if text == self.shown:
-            return
-        self.dirty = False
-        self.last_edit = now
-        self.shown = text
-        self.bot.edit_plain(self.chat_id, self.msg_id, text)
+        with self.edit_lock:
+            if self.finished:       # the final reply owns the message now
+                return
+            text = self.render()
+            if text == self.shown:
+                return
+            self.dirty = False
+            self.last_edit = now
+            self.shown = text
+            self.bot.edit_plain(self.chat_id, self.msg_id, text)
+
+    def finish(self):
+        """Stop streaming edits; waits for one in flight so it cannot overwrite the reply."""
+        with self.edit_lock:
+            self.finished = True
 
     def should_stop(self):
         return self.stop_waiting
@@ -918,7 +947,7 @@ class Bot:
             self.turns.pop(chat_id, None)
 
     def _turn_error(self, turn, text):
-        turn.finished = True
+        turn.finish()
         try:
             if turn.msg_id:
                 self.edit(turn.chat_id, turn.msg_id, text, html=False)
@@ -956,7 +985,7 @@ class Bot:
             on_event=turn.on_event, auto_approve=self.auto_approve, connector=self.muse.connect,
             approver=self.approve_forever, should_stop=turn.should_stop,
             recheck=turn.take_recheck, recheck_after=WATCHDOG, log=log)
-        turn.finished = True
+        turn.finish()
         log.info("turn end chat=%s session=%s outcome=%s status=%s secs=%.0f replies=%d%s",
                  turn.chat_id, turn.session_id or MAIN, res.get("outcome"), res.get("status"),
                  self.clock() - turn.started, len(res.get("replies") or []),
@@ -1010,14 +1039,14 @@ class Bot:
         else:
             self.deliver_interleaved(turn, res.get("replies") or [], media, notes, markup, stem)
         self.after_turn(turn, evs)
-        elapsed = self.clock() - turn.started
-        if elapsed >= LONG_TURN and outcome in ("done", "needs_input", "needs_approval", "failed"):
-            icon = {"done": "✅", "failed": "⚠️"}.get(outcome, "❓")
-            try:
-                self.api.call("sendMessage", chat_id=chat_id, reply_to_message_id=turn.msg_id,
-                              text=f"{icon} Muse finished ({fmt_secs(elapsed)}).")
-            except Exception:  # noqa: BLE001
-                pass
+
+    def drop_status_bubble(self, chat_id, msg_id, fallback):
+        """Delete a status-only message; if Telegram refuses, turn it into FALLBACK."""
+        try:
+            self.api.call("deleteMessage", chat_id=chat_id, message_id=msg_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("deleteMessage: %s", e)
+            self.edit(chat_id, msg_id, fallback, html=False)
 
     def turn_history(self, turn):
         try:
@@ -1056,9 +1085,9 @@ class Bot:
                 put((val + ("\n\n" + tail if last and tail else "")).strip(), markup if last else None)
                 continue
             q, r = val
-            if first[0]:        # media first: the streamed message becomes its heading
+            if first[0]:        # media first: drop the pure status bubble
                 first[0] = False
-                self.edit(chat_id, turn.msg_id, "🖼 " + (media_label(r) or media_name(r)), html=False)
+                self.drop_status_bubble(chat_id, turn.msg_id, "🖼 " + (media_label(r) or media_name(r)))
             self.send_media(chat_id, turn.session_id, q, r)
             if last and (tail or markup):
                 put(tail or "⬆️", markup)

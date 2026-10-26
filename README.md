@@ -289,8 +289,10 @@ Or run it in a terminal: `muse-cli telegram run`. With `--profile NAME` the
 unit is `muse-telegram-NAME.service` and runs `muse-cli --profile NAME telegram run`.
 
 **Using it.** Type to talk to Muse in the current conversation (main chat by
-default; each Telegram chat remembers its own). The reply streams into one
-message, long replies are split, and very long ones or big code blocks arrive
+default; each Telegram chat remembers its own). Each message gets one bot
+message: while Muse works it shows the same live status line as the Muse app (e.g. "🦆 Updating plan")
+plus the elapsed time; the reply then streams into the same
+message (no separate "finished" ping), long replies are split, and very long ones or big code blocks arrive
 as a `.md`/`.txt` file. When Muse asks something, its options (or Yes / No /
 Go ahead) show up as buttons; tap one or just type the answer. Photos and
 files you send are saved to System Files under `telegram-inbox/` and Muse is
