@@ -170,6 +170,7 @@ muse-cli wait --after-seq N [--thread ID]         # block until the turn ends (n
 muse-cli approvals ; muse-cli approve ID --always ; muse-cli deny ID
 muse-cli approve --all --always                   # approve everything pending, forever
 muse-cli auto-approve on|off|status               # wait/send approve approvals forever and keep going
+muse-cli --profile work status                    # another login; see Profiles below
 muse-cli watch --timeout 60                       # tail live agent events
 muse-cli usage                                    # plan: weekly limit % used, reset, bonus tokens
 muse-cli invite                                   # invite code, uses left, rewards (--json/--raw; --create makes one)
@@ -222,6 +223,28 @@ muse-cli send "what's on my calendar today?" | jq -r .reply.text
 
 Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer (incl. a plain-text question in the final reply; with `muse-cli auto-approve on`, `MUSE_AUTO_APPROVE=always` or `--auto-approve`, approvals are decided with `allow_always`, Muse's "Always allow" choice, listed in `auto_approved`, and the wait goes on), 124 timeout; always read `final_text`; `send` exits 5 if delivery is not acked.
 
+## Profiles
+
+Keep more than one muse.ai login side by side. Each profile has its own
+`cookies.txt`, `config.json` (auto-approve and other settings) and `chat.json`.
+
+- `default` (no flag, no env var) is the original location,
+  `~/.config/muse-cli/`. Nothing there moves.
+- A named profile lives in `~/.config/muse-cli/profiles/NAME/` (folder mode
+  700, cookies mode 600). Names are letters, digits, `-` and `_`.
+- Pick one with `--profile NAME` before the command, or `MUSE_CLI_PROFILE=NAME`.
+  The flag wins over the env var. A new profile starts with fresh-install
+  defaults (auto-approve off).
+
+```bash
+muse-cli --profile work auth export              # save a second login into profiles/work
+muse-cli --profile work status
+MUSE_CLI_PROFILE=work muse-cli send "hello" --until-done
+muse-cli --profile work auto-approve on          # settings are per profile
+muse-cli auth list                               # profiles, active one (*), cookies or not; offline
+muse-cli auth list --json
+```
+
 ## How it works
 
 ![how muse-cli connects](https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/assets/how-it-works.webp)
@@ -268,8 +291,9 @@ pyproject.toml
 ## Setup notes
 
 - Login is the [Log in once](#log-in-once) section above. Cookies live at
-  `~/.config/muse-cli/cookies.txt` (mode 600). Access and gateway tokens are
-  fetched fresh on every run.
+  `~/.config/muse-cli/cookies.txt` (mode 600), or in
+  `~/.config/muse-cli/profiles/NAME/` for a named [profile](#profiles).
+  Access and gateway tokens are fetched fresh on every run.
 - `auth export` reads those cookies from Google Chrome through
   [agent-browser](https://github.com/vercel-labs/agent-browser). Chrome has
   to be open, with remote debugging on

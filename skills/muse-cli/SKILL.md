@@ -210,7 +210,7 @@ approval without a forever option, or a failed decide, is reported in
 
 ```bash
 muse-cli auto-approve status   # {"auto_approve": "always"|"off", "source": ...}
-muse-cli auto-approve on       # persistent: ~/.config/muse-cli/config.json
+muse-cli auto-approve on       # persistent, in the active profile's config.json
 muse-cli auto-approve off
 MUSE_AUTO_APPROVE=always|off   # env override for one shell/process
 muse-cli wait ... --auto-approve | --no-auto-approve   # per call (send too)
@@ -220,9 +220,30 @@ muse-cli approvals --approve-all  # same
 
 Precedence: flag, then `MUSE_AUTO_APPROVE`, then the config. Default is off.
 
-On the user's Grok Bot box auto-approve is ON (the user enabled it
-permanently); check with `muse-cli auto-approve status` and do not turn it off
+On the user's Grok Bot box auto-approve is ON for the default profile (the
+user enabled it permanently); check with `muse-cli auto-approve status` and do not turn it off
 unless the user asks.
+
+## Profiles (several Muse logins)
+
+Every command reads one profile: its cookies, config (auto-approve etc.) and
+chat state. With no flag and no env var it is `default`, the original
+`~/.config/muse-cli/` (the user's main Muse; never move or edit its files by
+hand). A named profile is `~/.config/muse-cli/profiles/NAME/` (folder 700,
+cookies 600). Names: letters, digits, `-`, `_`.
+
+```bash
+muse-cli auth list                       # offline: profiles, active one (*), cookies or not
+muse-cli --profile work auth export      # log a second account in (same Chrome steps as 2b)
+muse-cli --profile work status
+MUSE_CLI_PROFILE=work muse-cli send "hello" --until-done
+muse-cli --profile work auto-approve on  # per-profile; new profiles start with it off
+```
+
+`--profile` goes before the subcommand and wins over `MUSE_CLI_PROFILE`.
+Errors and help print the active profile's real cookie path and the exact
+`muse-cli --profile NAME ...` command to run. For a named profile, use its
+path wherever 2b/2c say `~/.config/muse-cli/cookies.txt`.
 
 ## System Files (fs)
 

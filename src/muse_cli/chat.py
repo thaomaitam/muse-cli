@@ -7,13 +7,13 @@ import json
 import os
 import time
 
-from .cli import CONFIG_DIR, cmd_auth_export, connect, fmt_event, load_config
+from . import cli
+from .cli import cmd_auth_export, connect, fmt_event, load_config
 from .gateway import AuthError, GatewayError
 
 WAIT = 300   # seconds to wait for the first reply
 QUIET = 10   # seconds of silence after a reply before taking the next message
 POLL = 1     # seconds between history reads while waiting for a reply
-STATE = os.path.join(CONFIG_DIR, "chat.json")
 
 HELP = """Commands:
   /chats          list your conversations
@@ -21,20 +21,25 @@ HELP = """Commands:
   /main           switch to your main chat
   /new [title]    start a new conversation
   /history [N]    read the last N messages here (default 10)
-  /login          save your muse.ai login from Chrome again (same as `muse-cli auth export`)
+  /login          save your muse.ai login from Chrome again (same as `{auth_export}`)
   /exit           quit (Ctrl+C works too)"""
+
+
+def state_file():
+    """chat.json in the active profile's folder (the last conversation used)."""
+    return os.path.join(cli.CONFIG_DIR, "chat.json")
 
 
 def load_state():
     try:
-        return json.load(open(STATE))
+        return json.load(open(state_file()))
     except (OSError, ValueError):
         return {"session_id": None, "title": "main chat"}
 
 
 def save_state(st):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    json.dump(st, open(STATE, "w"), indent=2)
+    cli.ensure_config_dir()
+    json.dump(st, open(state_file(), "w"), indent=2)
 
 
 class Chat:
@@ -154,7 +159,7 @@ class Chat:
         cmd, _, arg = line.partition(" ")
         arg = arg.strip()
         if cmd in ("/help", "/?"):
-            print(HELP)
+            print(HELP.format(auth_export=cli.cli_cmd("auth export")))
         elif cmd == "/chats":
             self.list_chats()
         elif cmd == "/open":

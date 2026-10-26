@@ -10,6 +10,11 @@
 - Fork-only: this repo is github.com/thoitiettxl-cyber/muse-cli. Never install
   from, publish to, or point anything at PyPI or upstream nikships/muse-cli
   (they lack the fork's fixes). Installs come from `git+` the fork's `main`.
+- Profiles: `--profile NAME` / `MUSE_CLI_PROFILE`. `default` is
+  `~/.config/muse-cli/` and must never move; named profiles are
+  `~/.config/muse-cli/profiles/NAME/`. Code reads `cli.CONFIG_DIR`,
+  `CONFIG_FILE`, `COOKIES_FILE` at call time (set by `activate_profile`);
+  never capture them at import. `update.json` (update check) stays global.
 - No CI: there are no GitHub Actions workflows (the account has no Actions
   minutes). Run tests locally before pushing.
 
@@ -55,7 +60,7 @@ approval without a forever option, or a failed decide, is reported in
 
 ```bash
 muse-cli auto-approve status   # {"auto_approve": "always"|"off", "source": ...}
-muse-cli auto-approve on       # persistent: ~/.config/muse-cli/config.json
+muse-cli auto-approve on       # persistent, in the active profile's config.json
 muse-cli auto-approve off
 MUSE_AUTO_APPROVE=always|off   # env override for one shell/process
 muse-cli wait ... --auto-approve | --no-auto-approve   # per call (send too)

@@ -20,9 +20,132 @@ from . import __version__
 from .gateway import Gateway, AuthError, GatewayError, create_invite, fetch_invite, fetch_subscription, redeem_invite_code, load_cookies
 from .update import cmd_update, finish_update_check, start_update_check
 
-CONFIG_DIR = os.path.expanduser("~/.config/muse-cli")
+# -- Profiles -------------------------------------------------------------------
+# The `default` profile is the original layout, ~/.config/muse-cli/{config.json,
+# cookies.txt,chat.json}, and never moves. A named profile is a sibling login
+# at ~/.config/muse-cli/profiles/NAME/ with its own copies of those files.
+DEFAULT_PROFILE = "default"
+PROFILE_ENV = "MUSE_CLI_PROFILE"
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def base_config_dir():
+    """~/.config/muse-cli, resolved now (so a changed HOME is honored)."""
+    return os.path.expanduser("~/.config/muse-cli")
+
+
+def validate_profile_name(name):
+    """Return NAME if it is a safe slug ([A-Za-z0-9_-], 1-64 chars), else raise ValueError."""
+    if not isinstance(name, str) or not _PROFILE_RE.match(name):
+        raise ValueError(
+            f"invalid profile name {name!r}: use 1-64 letters, digits, '-' or '_'")
+    return name
+
+
+def resolve_profile(flag=None, environ=None):
+    """Active profile name: --profile flag, then $MUSE_CLI_PROFILE, then `default`."""
+    if flag is not None:
+        return validate_profile_name(flag)
+    env = (os.environ if environ is None else environ).get(PROFILE_ENV)
+    if env is not None and env.strip():
+        return validate_profile_name(env.strip())
+    return DEFAULT_PROFILE
+
+
+def profile_dir(name):
+    name = validate_profile_name(name)
+    if name == DEFAULT_PROFILE:
+        return base_config_dir()
+    return os.path.join(base_config_dir(), "profiles", name)
+
+
+def profile_paths(name):
+    d = profile_dir(name)
+    return {"dir": d, "config": os.path.join(d, "config.json"),
+            "cookies": os.path.join(d, "cookies.txt"), "chat": os.path.join(d, "chat.json")}
+
+
+PROFILE = DEFAULT_PROFILE
+CONFIG_DIR = base_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 COOKIES_FILE = os.path.join(CONFIG_DIR, "cookies.txt")
+
+
+def activate_profile(name):
+    """Point CONFIG_DIR/CONFIG_FILE/COOKIES_FILE at profile NAME. Creates nothing."""
+    global PROFILE, CONFIG_DIR, CONFIG_FILE, COOKIES_FILE
+    paths = profile_paths(name)
+    PROFILE = name
+    CONFIG_DIR, CONFIG_FILE, COOKIES_FILE = paths["dir"], paths["config"], paths["cookies"]
+    return paths
+
+
+def ensure_config_dir():
+    """Create the active profile's folder. Named profiles get mode 700; the
+    default folder is created exactly as before (it predates profiles)."""
+    if PROFILE == DEFAULT_PROFILE:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        return CONFIG_DIR
+    os.makedirs(os.path.dirname(CONFIG_DIR), mode=0o700, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    return CONFIG_DIR
+
+
+def cli_cmd(rest):
+    """`muse-cli REST` as the user should type it for the active profile."""
+    if PROFILE == DEFAULT_PROFILE:
+        return f"muse-cli {rest}"
+    return f"muse-cli --profile {PROFILE} {rest}"
+
+
+def _read_json(path):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def list_profiles():
+    """Every profile (default first, then profiles/*), read-only: no network, no writes."""
+    names = [DEFAULT_PROFILE]
+    pdir = os.path.join(base_config_dir(), "profiles")
+    try:
+        found = sorted(n for n in os.listdir(pdir)
+                       if os.path.isdir(os.path.join(pdir, n)) and _PROFILE_RE.match(n)
+                       and n != DEFAULT_PROFILE)
+    except OSError:
+        found = []
+    names += found
+    if PROFILE not in names:
+        names.append(PROFILE)
+    rows = []
+    for n in names:
+        paths = profile_paths(n)
+        try:
+            has_cookies = os.path.getsize(paths["cookies"]) > 0
+        except OSError:
+            has_cookies = False
+        cfg = _read_json(paths["config"])
+        rows.append({"name": n, "active": n == PROFILE, "dir": paths["dir"],
+                     "exists": os.path.isdir(paths["dir"]), "cookies": has_cookies,
+                     "cookies_file": paths["cookies"],
+                     "auto_approve": str(cfg.get("auto_approve") or "off").lower()})
+    return rows
+
+
+def cmd_auth_list(args):
+    rows = list_profiles()
+    if getattr(args, "json", False):
+        out({"active": PROFILE, "profiles": rows})
+        return
+    width = max(len(r["name"]) for r in rows)
+    for r in rows:
+        mark = "*" if r["active"] else " "
+        state = "cookies" if r["cookies"] else ("no cookies" if r["exists"] else "not created")
+        print(f"{mark} {r['name']:<{width}}  {state:<11}  {r['dir']}")
 
 
 def load_config():
@@ -31,6 +154,12 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         cfg = json.load(open(CONFIG_FILE))
     changed = False
+    # A named profile never borrows another profile's login: a config copied
+    # from elsewhere still reads this profile's cookies.
+    cf = cfg.get("cookies_file")
+    if (PROFILE != DEFAULT_PROFILE and cf and cf != COOKIES_FILE
+            and os.path.abspath(cf).startswith(base_config_dir() + os.sep)):
+        cfg["cookies_file"] = COOKIES_FILE
     cfg.setdefault("cookies_file", COOKIES_FILE)
     if "vm_id" not in cfg and os.environ.get("MUSE_VM_ID"):
         cfg["vm_id"] = os.environ["MUSE_VM_ID"]
@@ -41,13 +170,13 @@ def load_config():
             cfg["node_id"] = secrets.token_hex(8)
             changed = True
     if changed:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        ensure_config_dir()
         json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
     return cfg
 
 
 def save_config(cfg):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    ensure_config_dir()
     tmp = CONFIG_FILE + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(cfg, fh, indent=2)
@@ -94,13 +223,13 @@ def cmd_auto_approve(args):
 def connect(cfg):
     if not os.path.exists(cfg["cookies_file"]):
         raise AuthError(
-            f"no cookies at {cfg['cookies_file']}. Run `muse-cli auth export` "
+            f"no cookies at {cfg['cookies_file']}. Run `{cli_cmd('auth export')}` "
             "and follow the steps it prints: turn on Chrome remote debugging at "
             "chrome://inspect/#remote-debugging, open https://muse.ai/ in that "
             "window, then export again.")
     cookies = load_cookies(cfg["cookies_file"])
     if not cookies.strip():
-        raise AuthError(f"cookies file {cfg['cookies_file']} is empty; run `muse-cli auth export`")
+        raise AuthError(f"cookies file {cfg['cookies_file']} is empty; run `{cli_cmd('auth export')}`")
     return Gateway(cookies, vm_id=cfg.get("vm_id"))
 
 
@@ -183,11 +312,13 @@ def _print_hand_copy():
     print("Copy the login by hand instead:", file=sys.stderr)
     print("  1. In Chrome, open https://muse.ai/ and log in.", file=sys.stderr)
     print("  2. DevTools (F12) → Application → Cookies → https://muse.ai", file=sys.stderr)
-    print("  3. Write one line to ~/.config/muse-cli/cookies.txt", file=sys.stderr)
+    print(f"  3. Write one line to {COOKIES_FILE}", file=sys.stderr)
     print("       hatch_sess=VALUE; other_name=other_value", file=sys.stderr)
     print("     hatch_sess is required. Separate cookies with '; '.", file=sys.stderr)
-    print("  4. chmod 600 ~/.config/muse-cli/cookies.txt", file=sys.stderr)
-    print("  5. muse-cli status", file=sys.stderr)
+    if PROFILE != DEFAULT_PROFILE and not os.path.isdir(CONFIG_DIR):
+        print(f"     Create its folder first: mkdir -p -m 700 {CONFIG_DIR}", file=sys.stderr)
+    print(f"  4. chmod 600 {COOKIES_FILE}", file=sys.stderr)
+    print(f"  5. {cli_cmd('status')}", file=sys.stderr)
 
 
 def _print_chrome_debug_steps():
@@ -198,7 +329,7 @@ def _print_chrome_debug_steps():
     print("  2. Turn on remote debugging", file=sys.stderr)
     print('     ("Allow remote debugging for this browser instance").', file=sys.stderr)
     print("  3. Open https://muse.ai/ and log in. Leave that tab open.", file=sys.stderr)
-    print("  4. Run `muse-cli auth export` again.", file=sys.stderr)
+    print(f"  4. Run `{cli_cmd('auth export')}` again.", file=sys.stderr)
     print("     If Chrome asks to allow the connection, click Allow.", file=sys.stderr)
     print("     If this command already failed, run it again after Allow.", file=sys.stderr)
     print(file=sys.stderr)
@@ -218,7 +349,8 @@ def _print_need_agent_browser():
     print("  2. Open a new terminal, then:", file=sys.stderr)
     print("       npm i -g agent-browser", file=sys.stderr)
     print("       agent-browser --version", file=sys.stderr)
-    print("  3. Run `muse-cli auth export` again and follow the Chrome steps it prints.", file=sys.stderr)
+    print(f"  3. Run `{cli_cmd('auth export')}` again and follow the Chrome steps it prints.",
+          file=sys.stderr)
     print(file=sys.stderr)
     _print_hand_copy()
 
@@ -229,7 +361,7 @@ def _print_export_failure(err):
     if kind == "daemon":
         print("agent-browser is still running from an earlier attempt. Close it, then retry:", file=sys.stderr)
         print("  agent-browser close", file=sys.stderr)
-        print("  muse-cli auth export", file=sys.stderr)
+        print(f"  {cli_cmd('auth export')}", file=sys.stderr)
         print(file=sys.stderr)
         _print_chrome_debug_steps()
         return
@@ -239,18 +371,18 @@ def _print_export_failure(err):
     if kind == "tab":
         print("Chrome is connected, but no muse.ai tab is open.", file=sys.stderr)
         print("Open https://muse.ai/, log in, leave that tab open, and run", file=sys.stderr)
-        print("`muse-cli auth export` again.", file=sys.stderr)
+        print(f"`{cli_cmd('auth export')}` again.", file=sys.stderr)
         return
     if kind == "connected":
         print("Chrome is connected and the muse.ai tab is open.", file=sys.stderr)
         print("Remote debugging is already on. The cookie read did not come back.", file=sys.stderr)
-        print("Run `muse-cli auth export` again. If Chrome asks, click Allow.", file=sys.stderr)
+        print(f"Run `{cli_cmd('auth export')}` again. If Chrome asks, click Allow.", file=sys.stderr)
         print(file=sys.stderr)
         _print_hand_copy()
         return
     print(err, file=sys.stderr)
     print(file=sys.stderr)
-    print("Check both of these, then run `muse-cli auth export` again:", file=sys.stderr)
+    print(f"Check both of these, then run `{cli_cmd('auth export')}` again:", file=sys.stderr)
     print("  - chrome://inspect/#remote-debugging has remote debugging on", file=sys.stderr)
     print("  - https://muse.ai/ is open in that same Chrome and you are logged in", file=sys.stderr)
     print(file=sys.stderr)
@@ -302,7 +434,7 @@ def _browser_cookies():
 
 
 def cmd_auth_export(_args):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    ensure_config_dir()
     if shutil.which("agent-browser") is None:
         _print_need_agent_browser()
         sys.exit(1)
@@ -315,7 +447,7 @@ def cmd_auth_export(_args):
     if not any(c["name"] == "hatch_sess" for c in jar):
         print("Chrome answered, but the cookies do not include hatch_sess.", file=sys.stderr)
         print("That cookie is set only after you log in at https://muse.ai/.", file=sys.stderr)
-        print("Log in, leave the muse.ai tab open, and run `muse-cli auth export` again.",
+        print(f"Log in, leave the muse.ai tab open, and run `{cli_cmd('auth export')}` again.",
               file=sys.stderr)
         print(f"Left {COOKIES_FILE} unchanged.", file=sys.stderr)
         sys.exit(1)
@@ -421,7 +553,7 @@ def cmd_usage(args):
                                   action_id=cfg.get("subscription_action_id"))
     if cfg.get("subscription_action_id") != aid:
         cfg["subscription_action_id"] = aid
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        ensure_config_dir()
         json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
     if args.raw:
         out(sub)
@@ -1364,15 +1496,49 @@ def _chat(args):
     cmd_chat(args)
 
 
-def main():
-    ap = argparse.ArgumentParser(prog="muse-cli", description="CLI for your personal muse.ai agent")
+def _prescan_profile(argv):
+    """The --profile value given before the subcommand, or None.
+
+    Help text is built before argparse runs, so read the flag early; argparse
+    still parses (and owns) it afterwards. Stops at the first positional so a
+    message text like `send -- --profile` is never mistaken for the flag.
+    """
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--profile":
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if tok.startswith("--profile="):
+            return tok.split("=", 1)[1]
+        if tok == "--" or not tok.startswith("-"):
+            return None
+        i += 1
+    return None
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    profile_error = None
+    try:
+        activate_profile(resolve_profile(_prescan_profile(argv)))
+    except ValueError as e:
+        profile_error = str(e)
+        activate_profile(DEFAULT_PROFILE)
+
+    ap = argparse.ArgumentParser(
+        prog="muse-cli", description="CLI for your personal muse.ai agent",
+        epilog=f"Active profile: {PROFILE} ({CONFIG_DIR})")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    ap.add_argument(
+        "--profile", metavar="NAME", default=None,
+        help=f"use login/config profile NAME (default: ${PROFILE_ENV}, else 'default'). "
+             "'default' is ~/.config/muse-cli; others live in ~/.config/muse-cli/profiles/NAME")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("auth", help="auth helpers"); a = p.add_subparsers(dest="op", required=True)
     export_help = (
         "Copy your muse.ai login out of Google Chrome into\n"
-        "~/.config/muse-cli/cookies.txt (mode 600).\n"
+        f"{COOKIES_FILE} (mode 600).\n"
         "\n"
         "Chrome shares those cookies only after remote debugging is on.\n"
         "In the Chrome window you already use for muse.ai:\n"
@@ -1396,6 +1562,11 @@ def main():
         description=export_help,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     ).set_defaults(fn=cmd_auth_export)
+    q = a.add_parser("list", help="list profiles, the active one (*), and which have cookies (offline)",
+                     description="List the default profile and every ~/.config/muse-cli/profiles/NAME. "
+                                 "Read-only: no network, nothing is created.")
+    q.add_argument("--json", action="store_true", help="print as JSON")
+    q.set_defaults(fn=cmd_auth_list)
 
     sub.add_parser("chat", help="interactive chat (the default with no command)").set_defaults(fn=_chat)
     sub.add_parser("status", help="VM, session count, unread, identity").set_defaults(fn=cmd_status)
@@ -1540,7 +1711,13 @@ def main():
     p.add_argument("--param", action="append", default=[], help="path param k=v (repeatable)")
     p.add_argument("--timeout", type=int, default=30); p.set_defaults(fn=cmd_raw)
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if profile_error:
+        ap.error(profile_error)
+    try:
+        activate_profile(resolve_profile(args.profile))
+    except ValueError as e:
+        ap.error(str(e))
     if args.cmd is None:
         args.cmd, args.fn = "chat", _chat
     # A piped command prints JSON. The notice stays off unless both streams
