@@ -2,6 +2,7 @@
 # muse-cli installer: CLI (from the thoitiettxl-cyber fork, via uv) + agent skill.
 # No browser needed afterwards. Never installs from PyPI or upstream.
 # Usage: curl -fsSL https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/install.sh | bash
+#   no curl yet: wget -qO- https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/install.sh | bash
 set -u
 
 REPO_URL="${MUSE_CLI_REPO:-https://github.com/thoitiettxl-cyber/muse-cli.git}"
@@ -21,7 +22,36 @@ LEGACY_BIN="${MUSE_CLI_BIN:-$HOME/bin}/$BIN_NAME"
 
 fail() { echo "install failed: $1" >&2; exit 1; }
 
+# Fresh Debian/Ubuntu (and Fedora, Arch, Alpine) images often lack curl, git
+# or CA certificates; uv needs git to install from the fork. Install whatever
+# is missing with the system package manager (sudo when not root).
+need=""
+command -v curl >/dev/null || need="$need curl"
+command -v git >/dev/null || need="$need git"
+[ -e /etc/ssl/certs/ca-certificates.crt ] || [ -d /etc/pki/tls/certs ] || need="$need ca-certificates"
+if [ -n "$need" ]; then
+  SUDO=""
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null || fail "missing:$need. Install them (no sudo found) and rerun"
+    SUDO="sudo"
+  fi
+  echo "installing system packages:$need"
+  if command -v apt-get >/dev/null; then
+    $SUDO apt-get update -qq && $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $need
+  elif command -v dnf >/dev/null; then
+    $SUDO dnf install -y -q $need
+  elif command -v pacman >/dev/null; then
+    $SUDO pacman -Sy --noconfirm --needed $need
+  elif command -v apk >/dev/null; then
+    $SUDO apk add --no-cache $need
+  elif command -v zypper >/dev/null; then
+    $SUDO zypper -n install $need
+  else
+    fail "missing:$need and no known package manager; install them and rerun"
+  fi || fail "could not install:$need"
+fi
 command -v curl >/dev/null || fail "curl not found"
+command -v git >/dev/null || fail "git not found"
 
 if ! command -v uv >/dev/null; then
   echo "installing uv"
@@ -112,5 +142,9 @@ echo "Updates: in a terminal, $BIN_NAME notices a newer version on the fork's ma
 echo "Upgrade with: $BIN_NAME update"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) echo "NOTE: $BIN_DIR is not on your PATH; run 'uv tool update-shell' or use $BIN_DIR/$BIN_NAME" ;;
+  *)
+    # Make the command available in new terminals automatically.
+    uv tool update-shell >/dev/null 2>&1 || true
+    echo "NOTE: open a new terminal (or run: export PATH=\"$BIN_DIR:\$PATH\") before using $BIN_NAME"
+    ;;
 esac

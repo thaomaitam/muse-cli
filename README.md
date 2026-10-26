@@ -47,6 +47,8 @@ to `~/.agents/skills/muse-cli`:
 curl -fsSL https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/install.sh | bash
 ```
 
+On a fresh Debian/Ubuntu (also Fedora, Arch, Alpine) the installer adds missing `curl`, `git` and CA certificates with the system package manager (via `sudo` when not root), installs `uv`, and puts `muse-cli` on your PATH for new terminals. No curl yet? Use `wget -qO- https://raw.githubusercontent.com/thoitiettxl-cyber/muse-cli/main/install.sh | bash`.
+
 Upgrade with `muse-cli update`. In a terminal it also checks the fork's main branch once a day and, when a newer version exists, prints that command on stderr. It does not upgrade itself. Set `MUSE_NO_UPDATE_CHECK=1` to silence the notice. The check stays quiet when output is piped or `CI` is set. Remove with `uv tool uninstall muse-cli`.
 
 Logging in is a separate one-time step. Chrome shares its cookies after you
