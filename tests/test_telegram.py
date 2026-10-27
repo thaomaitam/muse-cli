@@ -1723,3 +1723,218 @@ def test_curl_sessions_are_never_shared_between_threads(monkeypatch):
     t.join()
     assert seen and seen[0].startswith("tg-http")            # still routed to the pool
     assert len(made) == 2 and made[0] != made[1]             # distinct per-thread sessions
+
+
+# -- a dropped gateway connection is invisible unless it stays down (0.5.8) ----------------------
+def _drop_current(msg="gateway connection lost: gateway connection closed"):
+    SharedGW.opened[-1].dead = ConnectionError(msg)
+    raise ConnectionError(msg)
+
+
+@pytest.fixture
+def shared_env(home):
+    server = Server()
+    SharedGW.opened = []
+    tg = FakeTelegram()
+    bot = tgbot.Bot(tg, muse=tgbot.Muse(connector=lambda cfg: SharedGW(server)), sync=True)
+    bot.edit_interval = 0
+    return types.SimpleNamespace(bot=bot, tg=tg, s=server, home=home)
+
+
+def _no_warning(tg):
+    bad = [t for t in tg.texts() if t and ("⚠️" in t or "connection" in t.lower())]
+    assert bad == []
+
+
+def test_drop_mid_turn_resumes_and_finishes_in_the_same_bubble(shared_env):
+    env = shared_env
+    other = "sandbox://workspace/imagine_media/second.webp"
+    calls, order = [], []
+    orig_send_file, orig_call = env.tg.send_file, env.tg.call
+
+    def send_file(chat_id, name, data, **kw):
+        order.append(("file", name))
+        return orig_send_file(chat_id, name, data, **kw)
+
+    def call(method, **p):
+        t = p.get("text") or ""
+        if method in ("sendMessage", "editMessageText") and "⏳" not in t and " · " not in t:
+            order.append((method, t))
+        if method == "deleteMessage":
+            order.append(("delete", p["message_id"]))
+        return orig_call(method, **p)
+    env.tg.send_file, env.tg.call = send_file, call
+
+    def script(sid):
+        calls.append(sid)
+        if len(calls) == 1:             # live: text, an image, then the connection drops
+            def gap():
+                env.s.add(sid, "message.assistant", "Xong rồi, ảnh vịt con đây.")
+                presentation(env.s, sid)
+                # said while the connection was down: another image and more text
+                presentation(env.s, sid, path=other, label="Second")
+                _drop_current()
+            return [ts("running"), text_append("Xong rồi, ảnh vịt con đây.", 50), live_presentation(), gap]
+
+        def tail():
+            env.s.add(sid, "message.assistant", "Một chú vịt con.")
+        # resubscribed on the new connection: the server replays the state, the turn ends
+        return [ts("running"), tail, ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("duck"))
+    assert len(calls) == 2 and len(SharedGW.opened) == 2      # reconnected once, resubscribed
+    _no_warning(env.tg)
+    # Muse's order, nothing lost, nothing twice
+    assert order == [("editMessageText", "Xong rồi, ảnh vịt con đây."),
+                     ("file", "media-generation-duck-0-abc.webp"),
+                     ("delete", order[2][1]),                 # the empty bubble opened after it
+                     ("file", "second.webp"),
+                     ("sendMessage", "Một chú vịt con.")]
+    assert sorted(env.s.downloads) == sorted([DUCK, other])
+    assert not env.bot.turns
+
+
+def test_drop_in_a_text_turn_keeps_the_status_bubble(shared_env):
+    env = shared_env
+    calls = []
+
+    def script(sid):
+        calls.append(1)
+        if len(calls) == 1:
+            return [ts("running"), text_append("Hel", 60), lambda: _drop_current()]
+        return [ts("running"), lambda: env.s.add(sid, "message.assistant", "Hello there."),
+                ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("hi"))
+    _no_warning(env.tg)
+    first_bubble = env.tg.sent("sendMessage")[0]
+    assert "Sending to Muse" in first_bubble["text"]
+    assert len(env.tg.sent("sendMessage")) == 1              # no extra message: same bubble
+    assert env.tg.sent("editMessageText")[-1]["text"] == "Hello there."
+
+
+def test_monitor_resubscribes_and_catches_up_once(home):
+    import time as _t
+    server, tg = Server(), FakeTelegram()
+    SharedGW.opened = []
+    bot = tgbot.Bot(tg, muse=tgbot.Muse(connector=lambda cfg: SharedGW(server)), sync=True)
+    bot.check_background(None)                                # watermark: now
+    subs = []
+
+    def script(sid):
+        subs.append(1)
+        if len(subs) == 1:
+            def gap():                  # Muse answers in the background while we are down
+                for i in range(20):     # lots of history: more than the usual 15-event look
+                    server.add(None, "tool.call", f"step {i}")
+                server.add(None, "message.assistant", "Background answer")
+                presentation(server, None, path="sandbox://workspace/bg.webp", label="BG")
+                for i in range(20):
+                    server.add(None, "tool.call", f"after {i}")
+                _drop_current()
+            return [gap]
+        return ["IDLE"]
+    server.script = script
+    server.idle_cap = 5
+    m = tgbot.Monitor(bot, None)
+    m.dirty_at = None
+    m.start()
+    end = _t.time() + 5
+    while _t.time() < end and not (tg.docs and any("Background answer" in (t or "") for t in tg.texts())):
+        _t.sleep(0.02)
+    m.stop()
+    m.join(timeout=6)
+    assert len(subs) >= 2 and len(SharedGW.opened) == 2
+    assert [t for t in tg.texts() if t and "Background answer" in t] != []
+    assert len([t for t in tg.texts() if t and "Background answer" in t]) == 1
+    assert [d["name"] for d in tg.docs] == ["bg.webp"]
+    _no_warning(tg)
+    bot.check_background(None, 60)                           # a later look sends nothing again
+    assert len([t for t in tg.texts() if t and "Background answer" in t]) == 1 and len(tg.docs) == 1
+
+
+def test_command_during_a_drop_is_retried_silently(shared_env):
+    env = shared_env
+    env.bot.muse.warm()
+    SharedGW.opened[0].dead = ConnectionError("gateway connection lost: gateway connection closed")
+    env.bot.handle_update(msg("/history"))
+    _no_warning(env.tg)
+    assert "hello earlier" in " ".join(t for t in env.tg.texts() if t)
+    assert len(SharedGW.opened) == 2
+
+
+def test_lost_write_is_not_repeated_but_unsent_one_is(home):
+    from muse_cli.gateway import ConnectionDown
+    server = Server()
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=lambda cfg: SharedGW(server))
+    muse.warm()
+    g = SharedGW.opened[0]
+    sent = []
+
+    def lost(method, *a, **kw):      # the request went out, then the connection died
+        sent.append(method)
+        g.dead = ConnectionError("eof")
+        raise ConnectionError("gateway connection lost: eof")
+    g.call_json = lost
+    with pytest.raises(ConnectionError):
+        muse.call("session.start", body={"params": {}})
+    assert sent == ["session.start"]                          # not sent twice
+    g2 = SharedGW.opened[-1]
+    if not g2.alive or g2 is g:
+        muse.live()
+        g2 = SharedGW.opened[-1]
+
+    def down(method, *a, **kw):      # dead before sending: safe to repeat
+        g2.dead = ConnectionDown("down")
+        raise ConnectionDown("gateway connection is down")
+    g2.call_json = down
+    assert muse.call("session.start", body={"params": {"title": "x"}}) == {"session_id": "T1"}
+
+
+def test_prolonged_outage_notifies_once_then_reconnected_once(home):
+    server, tg = Server(), FakeTelegram()
+    state = {"up": False}
+
+    def connector(cfg):
+        if not state["up"]:
+            raise ConnectionError("network unreachable")
+        return SharedGW(server)
+    SharedGW.opened = []
+    muse = tgbot.Muse(connector=connector)
+    muse.DOWN_NOTICE, muse.DOWN_FAILS, muse.FAIL_SPACING = 0.2, 99, 0
+    bot = tgbot.Bot(tg, muse=muse, sync=True)
+    import time as _t
+    for _ in range(3):                  # a short blip: no notice
+        with pytest.raises(ConnectionError):
+            muse.live()
+    assert not tg.texts()
+    _t.sleep(0.25)
+    for _ in range(10):                 # still down past DOWN_NOTICE: one notice, not ten
+        with pytest.raises(ConnectionError):
+            muse.live()
+    downs = [t for t in tg.texts() if "Can't reach Muse" in t]
+    assert len(downs) == 1
+    state["up"] = True
+    muse.live()
+    muse.live()
+    ups = [t for t in tg.texts() if "Reconnected" in t]
+    assert len(ups) == 1 and len(tg.texts()) == 2
+    # a later blip that recovers at once stays silent
+    SharedGW.opened[-1].dead = ConnectionError("blip")
+    muse.live()
+    assert len(tg.texts()) == 2
+
+
+def test_failed_reconnects_in_a_row_also_notify_once(home):
+    tg = FakeTelegram()
+
+    def connector(cfg):
+        raise ConnectionError("no route")
+    muse = tgbot.Muse(connector=connector)
+    muse.DOWN_FAILS, muse.FAIL_SPACING = 3, 0
+    tgbot.Bot(tg, muse=muse, sync=True)
+    for _ in range(6):
+        with pytest.raises(ConnectionError):
+            muse.live()
+    assert len([t for t in tg.texts() if "Can't reach Muse" in t]) == 1

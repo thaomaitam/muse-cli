@@ -1228,7 +1228,8 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     attempt, failures = 0, 0
     while w.result is None and time.time() < deadline and not user_stop():
         if attempt:
-            time.sleep(min(RESUB_PAUSE * (2 ** min(failures, 5)), 30) if failures else RESUB_PAUSE)
+            # failures counts consecutive ones: a single drop resubscribes after RESUB_PAUSE
+            time.sleep(min(RESUB_PAUSE * (2 ** min(failures - 1, 5)), 30) if failures else RESUB_PAUSE)
             if w.result is not None or user_stop() or time.time() >= deadline:
                 break
         attempt += 1
@@ -1248,7 +1249,13 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
                              idle_timeout=idle, overall_timeout=left, on_record=on_record,
                              should_stop=stop_now)
             failures = 0
-        except (GatewayError, TimeoutError, ConnectionError, OSError) as e:
+        except ConnectionError as e:
+            # A dropped connection: resubscribe; the server replays the current
+            # task.status and the final replies are read from chat.history, so
+            # nothing said during the gap is lost.
+            failures += 1
+            log.info("wait: connection dropped (%s); resubscribing", e)
+        except (GatewayError, TimeoutError, OSError) as e:
             failures += 1
             log.warning("wait: subscription failed (%s); retrying", e)
         finally:

@@ -306,7 +306,9 @@ with the outcome, plus a `timing` line per turn (seconds since your message
 arrived, per phase: `delivered`, `first_status`, `media_sent`, `turn_end`,
 `final_edit`, …); messages appear only as a short prefix. The bot keeps one
 warm, multiplexed connection to Muse (heartbeat every 25 s, reconnected
-transparently) and warm HTTPS connections to Telegram, so its own overhead per
+transparently: a drop is not reported, running turns and background chats
+resubscribe and catch up from history; only an outage longer than a minute
+gets one "Can't reach Muse" message and one "Reconnected" when it is back) and warm HTTPS connections to Telegram, so its own overhead per
 hop is about 0.1 s.
 
 | Command | What it does |

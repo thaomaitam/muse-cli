@@ -93,6 +93,11 @@ def join_chunks(partial, ntf):
     return b"".join(parts[i] for i in sorted(parts))
 
 
+class ConnectionDown(ConnectionError):
+    """The connection was already down when a request was made: nothing was
+    sent, so the request is safe to repeat on a new connection."""
+
+
 class GatewayError(RuntimeError):
     def __init__(self, status, payload):
         super().__init__(f"gateway status={status} payload={payload!r}")
@@ -505,7 +510,7 @@ class Gateway:
     def _open(self, method, path_params=None, body=None, query=None, route=None, track=True):
         """Start a stream. track=False: nobody reads its frames (they are dropped)."""
         if self.dead is not None or self.closed:
-            raise ConnectionError(f"gateway connection is down ({self.dead or 'closed'})")
+            raise ConnectionDown(f"gateway connection is down ({self.dead or 'closed'})")
         route = route or ROUTES[method]
         path = route["path"]
         for k, v in (path_params or {}).items():

@@ -154,18 +154,37 @@ class Muse:
     when it drops. `connector(cfg)` defaults to `cli.connect`; tests pass a
     fake gateway. A connector whose gateways cannot be shared (no `lease()`)
     gets one connection per call, as before.
+
+    A dropped connection is invisible to callers: connect() hands out a
+    SharedConn that always uses the current connection, and repeats a request
+    on a new one when that is safe (nothing was sent yet, or a read). Only a
+    connection that stays down past DOWN_NOTICE seconds (or DOWN_FAILS failed
+    reconnects) is reported, once, through on_down; on_up follows on recovery.
     """
 
     HEARTBEAT = 25     # seconds of idleness before a connection.ping
+    DOWN_NOTICE = 60   # seconds without a working connection before on_down
+    DOWN_FAILS = 5     # ... or this many failed reconnects in a row
+    RETRY_FOR = 30     # seconds a request keeps retrying across a reconnect
+    FAIL_SPACING = 2   # failed reconnects closer than this count once
 
-    def __init__(self, connector=None, on_auth_error=None, on_auth_ok=None):
+    def __init__(self, connector=None, on_auth_error=None, on_auth_ok=None,
+                 on_down=None, on_up=None):
         self.connector = connector
         self.cfg = None
         self.on_auth_error = on_auth_error
         self.on_auth_ok = on_auth_ok
+        self.on_down = on_down
+        self.on_up = on_up
         self.shared = None
         self.shared_lock = threading.Lock()
         self.connects = 0          # real connections opened (for tests / logs)
+        self.drops = 0             # connections lost (for tests / logs)
+        self.down_since = None     # first moment without a working connection
+        self.down_fails = 0
+        self.down_notified = False
+        self._last_fail = 0.0
+        self.down_lock = threading.Lock()
         self._hb = None
         self._hb_stop = threading.Event()
 
@@ -179,6 +198,42 @@ class Muse:
     def config(self):
         return self.cfg if self.cfg is not None else self.reload()
 
+    # -- health: quiet on a blip, one notice when it stays down -------------------
+    def mark_down(self, err, failed_connect=False):
+        notify = False
+        with self.down_lock:
+            if self.down_since is None:
+                self.down_since = time.time()
+            if failed_connect and time.time() - self._last_fail >= self.FAIL_SPACING:
+                # several threads failing at the same moment count as one attempt
+                self.down_fails += 1
+                self._last_fail = time.time()
+            if not self.down_notified and (time.time() - self.down_since >= self.DOWN_NOTICE
+                                           or self.down_fails >= self.DOWN_FAILS):
+                self.down_notified = notify = True
+            since = self.down_since
+        if notify:
+            log.warning("gateway down for %.0fs (%d failed reconnects): %s",
+                        time.time() - since, self.down_fails, err)
+            if self.on_down:
+                try:
+                    self.on_down(err, time.time() - since)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("down notice: %s", e)
+
+    def mark_up(self):
+        with self.down_lock:
+            if self.down_since is None:
+                return
+            was, since = self.down_notified, self.down_since
+            self.down_since, self.down_fails, self.down_notified = None, 0, False
+            self._last_fail = 0.0
+        if was and self.on_up:
+            try:
+                self.on_up(time.time() - since)
+            except Exception as e:  # noqa: BLE001
+                log.warning("up notice: %s", e)
+
     def _open(self, cfg):
         try:
             gw = (self.connector or cli.connect)(cfg or self.config())
@@ -186,30 +241,54 @@ class Muse:
             if self.on_auth_error:
                 self.on_auth_error(e)
             raise
+        except Exception as e:
+            self.mark_down(e, failed_connect=True)
+            raise
         self.connects += 1
         if self.on_auth_ok:
             self.on_auth_ok()
         return gw
 
-    def connect(self, cfg=None):
-        """A gateway to use and close(): a lease on the shared connection
-        (close() leaves it up), or a fresh connection if it cannot be shared."""
+    def live(self, cfg=None):
+        """The shared connection, (re)opened if it is missing or dead."""
         g = self.shared
         if g is not None and getattr(g, "alive", False):
-            return g.lease()
+            return g
         with self.shared_lock:
             g = self.shared
             if g is not None and getattr(g, "alive", False):
-                return g.lease()
+                return g
+            if g is not None:
+                self.drops += 1
+                self.mark_down(getattr(g, "dead", None) or "closed")
+                log.info("gateway connection dropped (%s); reconnecting", getattr(g, "dead", None))
             t0 = time.time()
             gw = self._open(cfg)
             if not hasattr(gw, "lease"):
-                return gw
+                return gw          # cannot be shared: the caller owns (and closes) it
             old, self.shared = self.shared, gw
             log.info("gateway connected in %.2fs", time.time() - t0)
+        self.mark_up()
         if old is not None:
             old.close()
-        return gw.lease()
+        return gw
+
+    def connect(self, cfg=None):
+        """A gateway to use and close(): a SharedConn on the shared connection
+        (close() leaves it up), or a fresh connection if it cannot be shared."""
+        g = self.live(cfg)
+        if not hasattr(g, "lease"):
+            return g
+        return SharedConn(self, cfg)
+
+    def drop(self, g):
+        """Forget a connection that failed its heartbeat; the next call reconnects."""
+        with self.shared_lock:
+            if self.shared is g:
+                self.shared = None
+                self.drops += 1
+        self.mark_down("heartbeat failed")
+        g.close()
 
     def warm(self):
         """Open the shared connection now so the first message does not pay for it."""
@@ -233,11 +312,13 @@ class Muse:
         def loop():
             while not self._hb_stop.wait(min(5, interval)):
                 g = self.shared
-                if g is None:
-                    continue
-                if not getattr(g, "alive", True):
-                    log.info("gateway connection dropped (%s); reconnecting", getattr(g, "dead", None))
-                    self.warm()
+                if g is None or not getattr(g, "alive", True):
+                    if g is None and self.down_since is None and self.connects == 0:
+                        continue      # never connected yet: the first call opens it
+                    try:
+                        self.live()   # keep trying while down (quietly; see mark_down)
+                    except Exception as e:  # noqa: BLE001
+                        log.info("gateway reconnect failed: %s", e)
                     continue
                 if time.time() - getattr(g, "last_used", 0) < interval:
                     continue
@@ -245,11 +326,11 @@ class Muse:
                     g.ping()
                 except Exception as e:  # noqa: BLE001
                     log.info("gateway heartbeat failed (%s); reconnecting", e)
-                    with self.shared_lock:
-                        if self.shared is g:
-                            self.shared = None
-                    g.close()
-                    self.warm()
+                    self.drop(g)
+                    try:
+                        self.live()
+                    except Exception as e2:  # noqa: BLE001
+                        log.info("gateway reconnect failed: %s", e2)
         self._hb = threading.Thread(target=loop, daemon=True, name="muse-heartbeat")
         self._hb.start()
 
@@ -265,28 +346,12 @@ class Muse:
             g.close()
 
     def call(self, method, **kw):
-        """call_json on the shared connection; one retry on a fresh connection
-        if the shared one turned out to be dead (reads are safe to repeat)."""
-        for attempt in (0, 1):
-            g = self.connect()
-            try:
-                return g.call_json(method, **kw)
-            except ConnectionError:
-                if attempt:
-                    raise   # the next connect() replaces a dead shared connection
-            finally:
-                g.close()
+        with self.gw() as g:
+            return g.call_json(method, **kw)
 
     def download(self, ref):
-        for attempt in (0, 1):
-            g = self.connect()
-            try:
-                return g.download_file(ref)
-            except ConnectionError:
-                if attempt:
-                    raise
-            finally:
-                g.close()
+        with self.gw() as g:
+            return g.download_file(ref)
 
     def history(self, session_id=None, limit=20):
         body = {"limit": limit}
@@ -299,6 +364,95 @@ class Muse:
         from .fs import FS
         with self.gw() as g:
             return fn(FS(g))
+
+
+_READ_WORDS = ("history", "list", "read", "stat", "get", "identity", "status", "unread",
+               "ping", "approvals", "usage", "session.info")
+
+
+def _safe_to_repeat(method, route=None):
+    """A request that only reads, so repeating it after a lost reply is harmless."""
+    from .gateway import ROUTES
+    r = route or ROUTES.get(method) or {}
+    if str(r.get("http") or "").upper() == "GET":
+        return True
+    return method != "chat.stream" and any(w in method for w in _READ_WORDS)
+
+
+class SharedConn:
+    """What Muse.connect() hands out: the shared connection as it is at each
+    call. A request on a connection that just dropped is repeated on the new
+    one when nothing was sent yet or it only reads; subscriptions are opened
+    on the current connection (their callers resubscribe on a drop)."""
+
+    def __init__(self, muse, cfg=None):
+        self._muse = muse
+        self._cfg = cfg
+
+    def _gw(self):
+        return self._muse.live(self._cfg)
+
+    def __getattr__(self, name):
+        return getattr(self._gw(), name)
+
+    @property
+    def alive(self):
+        g = self._muse.shared
+        return g is not None and getattr(g, "alive", False)
+
+    def lease(self):
+        return self
+
+    def close(self):
+        pass
+
+    def _retry(self, what, safe, fn):
+        from .gateway import ConnectionDown
+        deadline = time.time() + self._muse.RETRY_FOR
+        pause = 0.25
+        while True:
+            try:
+                g = self._gw()
+            except AuthError:
+                raise
+            except Exception as e:  # noqa: BLE001 - the reconnect failed: keep trying a while
+                if time.time() + pause > deadline:
+                    raise
+                log.info("%s: reconnect failed (%s); retrying", what, e)
+            else:
+                try:
+                    return fn(g)
+                except ConnectionError as e:
+                    if not (isinstance(e, ConnectionDown) or safe) or time.time() + pause > deadline:
+                        raise
+                    log.info("%s: %s; retrying on a new connection", what, e)
+            time.sleep(pause)
+            pause = min(pause * 2, 4)
+
+    def _open(self, method, path_params=None, body=None, query=None, route=None, track=True):
+        return self._retry(method, False, lambda g: g._open(
+            method, path_params=path_params, body=body, query=query, route=route, track=track))
+
+    def call_json(self, method, *a, **kw):
+        return self._retry(method, _safe_to_repeat(method), lambda g: g.call_json(method, *a, **kw))
+
+    def request(self, method, *a, **kw):
+        return self._retry(method, _safe_to_repeat(method, kw.get("route")),
+                           lambda g: g.request(method, *a, **kw))
+
+    def download_file(self, ref, *a, **kw):
+        return self._retry("download", True, lambda g: g.download_file(ref, *a, **kw))
+
+    def subscribe_raw(self, method, *a, **kw):
+        # only a connection that is down before the stream opens is retried here
+        from .gateway import ConnectionDown
+        for attempt in (0, 1, 2):
+            try:
+                return self._gw().subscribe_raw(method, *a, **kw)
+            except ConnectionDown:
+                if attempt == 2:
+                    raise
+                time.sleep(0.25)
 
 
 # -- small helpers -----------------------------------------------------------------
@@ -663,6 +817,8 @@ class Bot:
         self.muse = muse or Muse()
         self.muse.on_auth_error = self.auth_problem
         self.muse.on_auth_ok = self.auth_ok
+        self.muse.on_down = self.muse_down
+        self.muse.on_up = self.muse_up
         self.callbacks = collections.OrderedDict()
         self.turns = {}            # chat_id -> Turn
         self.queues = collections.defaultdict(collections.deque)
@@ -994,6 +1150,14 @@ class Bot:
             self.state["auth_broken"] = False
             self.save_state()
         self.notify("✅ muse.ai login works again.", silent=True)
+
+    def muse_down(self, err, secs):
+        """Muse unreachable for a while (not a blip): one notice until it is back."""
+        self.notify("⚠️ <b>Can't reach Muse</b> for %s (%s). I keep reconnecting and will tell "
+                    "you when it works again." % (fmt_secs(secs), esc(str(err)[:200])), silent=True)
+
+    def muse_up(self, secs):
+        self.notify("✅ Reconnected to Muse (was down %s)." % fmt_secs(secs), silent=True)
 
     # -- dispatch ---------------------------------------------------------------
     def handle_update(self, u):
@@ -1366,55 +1530,53 @@ class Bot:
 
     def finish_split(self, turn, res, evs, notes, markup):
         """Final text when files already went out mid-turn: each reply goes in
-        the bubble between the files it sits between (Muse's seq order), files
-        missed live follow, notes and buttons go last; empty bubbles are removed."""
+        the bubble between the files it sits between (Muse's seq order). Files
+        not sent live (e.g. shown while the connection was down) and the text
+        after the last live file follow in order in the open bubble and below
+        it; notes and buttons go last; empty bubbles are removed."""
         chat_id = turn.chat_id
         stem = f"muse-reply-{turn.user_seq}"
         live = {p: i for i, p in enumerate(turn.live_order)}
         shown = media_from_events(evs, turn.user_seq or 0)
-        items = sorted([(r.get("seq") or 0, 0, "text", r["text"]) for r in res.get("replies") or []
+        items = sorted([(r.get("seq") or 0, 0, "text", r) for r in res.get("replies") or []
                         if r.get("text")]
                        + [(q, 1, "media", r) for q, r in shown], key=lambda x: (x[0], x[1]))
         groups = [[] for _ in range(len(turn.live_order) + 1)]
         g, late = 0, []
-        for _q, _o, kind, val in items:
+        for q, _o, kind, val in items:
             if kind == "text":
                 groups[g].append(val)
             elif val["path"] in live:
                 g = max(g, live[val["path"]] + 1)
-            elif not self.media_sent(chat_id, turn.session_id, _q, val):
-                late.append((_q, val))
-        ids = list(turn.bubbles) + [turn.msg_id]
-        tail = "\n".join(notes)
+            elif not self.media_sent(chat_id, turn.session_id, q, val):
+                late.append((q, val))
         late = late[:MAX_FILES_PER_TURN]
+        ids = list(turn.bubbles) + [turn.msg_id]
         carry = []
-        for i, (bid, texts) in enumerate(zip(ids, groups)):
-            last = i == len(ids) - 1
-            texts = carry + texts
+        for bid, replies in zip(ids[:-1], groups[:-1]):
+            replies = carry + replies
             carry = []
-            if bid is None and not last and texts:
-                carry = texts      # its bubble is gone (the file came first): move on
-                continue
-            body = "\n\n".join(texts).strip()
-            if last and tail and not late:
-                body = (body + "\n\n" + tail).strip()
-            mk = markup if last and not late else None
-            if not body and mk:
-                body = "⬆️"
-            if not body:
-                if bid is not None:
-                    self.drop_status_bubble(chat_id, bid, "⬆️")
-                continue
             if bid is None:
-                self.send_md(chat_id, body, mk)
-            elif mk is None and turn.bubble_text.get(bid) == body:
-                pass               # already final (frozen before the file)
-            else:
-                self.deliver_reply(chat_id, bid, body, mk, stem=stem)
-        for q, r in late:
-            self.send_media(chat_id, turn.session_id, q, r)
-        if late and (tail or markup):
-            self.send_md(chat_id, tail or "⬆️", markup)
+                carry = replies    # its bubble is gone (the file came first): move on
+                continue
+            body = "\n\n".join(r["text"] for r in replies).strip()
+            if not body:
+                self.drop_status_bubble(chat_id, bid, "⬆️")
+            elif turn.bubble_text.get(bid) != body:
+                self.deliver_reply(chat_id, bid, body, stem=stem)
+        replies = carry + groups[-1]
+        turn.msg_id = ids[-1]
+        if replies or late:
+            self.deliver_interleaved(turn, replies, late, notes, markup, stem)
+            return
+        tail = "\n".join(notes) or ("⬆️" if markup else "")
+        if not tail:
+            if turn.msg_id is not None:
+                self.drop_status_bubble(chat_id, turn.msg_id, "⬆️")
+        elif turn.msg_id is None:
+            self.send_md(chat_id, tail, markup)
+        else:
+            self.deliver_reply(chat_id, turn.msg_id, tail, markup, stem=stem)
 
     def drop_status_bubble(self, chat_id, msg_id, fallback):
         """Delete a status-only message; if Telegram refuses, turn it into FALLBACK."""
@@ -1447,8 +1609,9 @@ class Bot:
         first = [True]
 
         def put(t, mk=None):
-            if first[0]:
-                first[0] = False
+            bubble = first[0] and turn.msg_id is not None
+            first[0] = False
+            if bubble:
                 self.deliver_reply(chat_id, turn.msg_id, t, mk, stem=stem)
             elif needs_document(t):
                 self.send_doc(chat_id, doc_name(stem, t), t.encode(), caption="Muse's full reply", markup=mk)
@@ -1463,7 +1626,9 @@ class Bot:
             q, r = val
             if first[0]:        # media first: drop the pure status bubble
                 first[0] = False
-                self.drop_status_bubble(chat_id, turn.msg_id, "🖼 " + (media_label(r) or media_name(r)))
+                if turn.msg_id is not None:
+                    self.drop_status_bubble(chat_id, turn.msg_id,
+                                            "🖼 " + (media_label(r) or media_name(r)))
             self.send_media(chat_id, turn.session_id, q, r)
             if last and (tail or markup):
                 put(tail or "⬆️", markup)
@@ -2161,12 +2326,14 @@ class Bot:
                 m.stop()
             self.monitors.clear()
 
-    def check_background(self, session_id):
-        """Forward complete assistant messages that no bot turn delivered."""
+    def check_background(self, session_id, limit=15):
+        """Forward complete assistant messages that no bot turn delivered.
+        Everything after the watermark is read from history, so events missed
+        while a subscription was down are caught up (LIMIT: how far back)."""
         from .wait import clean_text
         if self.session_busy(session_id):
             return
-        evs = self.muse.history(session_id, 15)
+        evs = self.muse.history(session_id, limit)
         if self.session_busy(session_id):
             return
         top = max((e.get("seq") or 0 for e in evs), default=0)
@@ -2292,12 +2459,14 @@ class Monitor(threading.Thread):
         self.session_id = session_id
         self.stop_ev = threading.Event()
         self.dirty_at = 0.0       # check once at start (sets the watermark)
+        self.resumed = False      # after a drop: read further back in history
 
     def stop(self):
         self.stop_ev.set()
 
     def run(self):
         backoff = 2
+        name = self.session_id or MAIN
         while not self.stop_ev.is_set():
             try:
                 gw = self.bot.muse.connect()
@@ -2305,9 +2474,9 @@ class Monitor(threading.Thread):
                 self.stop_ev.wait(300)
                 continue
             except Exception as e:  # noqa: BLE001
-                log.warning("monitor %s: connect failed: %s", self.session_id or MAIN, e)
+                log.info("monitor %s: connect failed: %s", name, e)
                 self.stop_ev.wait(backoff)
-                backoff = min(backoff * 2, 300)
+                backoff = min(backoff * 2, 60)
                 continue
             backoff = 2
             try:
@@ -2316,8 +2485,15 @@ class Monitor(threading.Thread):
                     body["session_id"] = self.session_id
                 gw.subscribe_raw("chat.subscribe", body=body, max_records=10**9, idle_timeout=900,
                                  overall_timeout=1800, on_record=self.on_record, should_stop=self.tick)
+            except ConnectionError as e:
+                # Dropped: resubscribe on the new connection and catch up on
+                # anything said meanwhile from history (watermark + dedupe).
+                log.info("monitor %s: connection dropped (%s); resubscribing", name, e)
+                self.resumed = True
+                self.dirty_at = time.time() - 1.5
+                self.stop_ev.wait(0.5)
             except Exception as e:  # noqa: BLE001
-                log.warning("monitor %s: %s", self.session_id or MAIN, e)
+                log.warning("monitor %s: %s", name, e)
                 self.stop_ev.wait(backoff)
             finally:
                 gw.close()
@@ -2347,8 +2523,9 @@ class Monitor(threading.Thread):
             return True
         if self.dirty_at is not None and time.time() - self.dirty_at > 1.5:
             self.dirty_at = None
+            limit, self.resumed = (60 if self.resumed else 15), False
             try:
-                self.bot.check_background(self.session_id)
+                self.bot.check_background(self.session_id, limit)
             except AuthError:
                 pass
             except Exception as e:  # noqa: BLE001
