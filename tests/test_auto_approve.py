@@ -9,7 +9,8 @@ from unittest import mock
 
 from muse_cli import cli
 from muse_cli.gateway import join_chunks
-from muse_cli.wait import EXIT_HUMAN, EXIT_OK, FOREVER, Waiter, describe_approval, offers_forever
+from muse_cli.wait import (EXIT_HUMAN, EXIT_OK, FOREVER, ONCE, Waiter, choose_auto_decision,
+                           describe_approval, offers_forever)
 
 ROOT = "r1"
 OPTIONS = [{"kind": "allow_once", "label_text": "Allow once"},
@@ -108,6 +109,65 @@ class ForeverTest(unittest.TestCase):
         self.assertTrue(offers_forever(describe_approval(appr("a2", options=None))))
 
 
+class AllowOnceSettingTest(unittest.TestCase):
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop("MUSE_AUTO_ALLOW_ONCE", None)
+
+    def tearDown(self):
+        self.env.stop()
+
+    def test_default_off(self):
+        self.assertFalse(cli.auto_allow_once_setting({})[0])
+        self.assertFalse(cli.auto_allow_once_setting({"auto_allow_once": False})[0])
+
+    def test_config_forms(self):
+        self.assertTrue(cli.auto_allow_once_setting({"auto_allow_once": True})[0])
+        self.assertTrue(cli.auto_allow_once_setting({"auto_allow_once": "on"})[0])
+        self.assertFalse(cli.auto_allow_once_setting({"auto_allow_once": "off"})[0])
+
+    def test_config_env_flag_precedence(self):
+        cfg = {"auto_allow_once": True}
+        self.assertEqual(cli.auto_allow_once_setting(cfg)[0], True)
+        os.environ["MUSE_AUTO_ALLOW_ONCE"] = "off"
+        self.assertEqual(cli.auto_allow_once_setting(cfg),
+                         (False, "env MUSE_AUTO_ALLOW_ONCE"))
+        self.assertEqual(cli.auto_allow_once_setting(cfg, True), (True, "flag"))
+        os.environ["MUSE_AUTO_ALLOW_ONCE"] = "on"
+        self.assertTrue(cli.auto_allow_once_setting({})[0])
+        self.assertEqual(cli.auto_allow_once_setting({}, False), (False, "flag"))
+        os.environ["MUSE_AUTO_ALLOW_ONCE"] = "maybe"
+        with self.assertRaises(ValueError):
+            cli.auto_allow_once_setting({})
+
+    def test_once_command_persists_and_status_shows_both(self):
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, "config.json")
+        with open(f, "w") as fh:
+            json.dump({"node_id": "n", "cookies_file": "c"}, fh)
+        with mock.patch.object(cli, "CONFIG_DIR", d), mock.patch.object(cli, "CONFIG_FILE", f):
+            for state, once_state, want in (("once", "on", True), ("status", None, True),
+                                            ("once", "off", False)):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    cli.cmd_auto_approve(argparse.Namespace(state=state, once_state=once_state))
+                got = json.loads(buf.getvalue())
+                self.assertEqual(got["auto_allow_once"], want, (state, once_state))
+                self.assertIn("auto_approve", got)
+            with open(f) as fh:
+                saved = json.load(fh)
+        self.assertEqual(saved["auto_allow_once"], False)
+        self.assertEqual(saved["node_id"], "n")
+
+    def test_allow_once_flags_parse(self):
+        p = argparse.ArgumentParser()
+        cli._auto_allow_once_flags(p)
+        self.assertIsNone(p.parse_args([]).auto_allow_once)
+        self.assertTrue(p.parse_args(["--auto-allow-once"]).auto_allow_once)
+        self.assertFalse(p.parse_args(["--no-auto-allow-once"]).auto_allow_once)
+
+
 class SettingTest(unittest.TestCase):
     def setUp(self):
         self.env = mock.patch.dict(os.environ, {}, clear=False)
@@ -152,10 +212,11 @@ class SettingTest(unittest.TestCase):
 
 
 class RunWaitTest(unittest.TestCase):
-    def run_wait(self, w, auto):
+    def run_wait(self, w, auto, allow_once=None):
         err = io.StringIO()
         with mock.patch.object(cli, "connect", lambda cfg: FakeGateway(w)), redirect_stderr(err):
-            code, res = cli.run_wait({}, after_seq=10, timeout=5, auto_approve=auto)
+            code, res = cli.run_wait({}, after_seq=10, timeout=5, auto_approve=auto,
+                                     auto_allow_once=allow_once)
         return code, res, err.getvalue()
 
     def test_auto_approves_forever_and_finishes(self):
@@ -192,12 +253,90 @@ class RunWaitTest(unittest.TestCase):
         self.assertEqual((code, res["outcome"]), (EXIT_HUMAN, "needs_approval"))
         self.assertEqual(res["auto_approve_errors"][0]["approval_id"], "a1")
 
-    def test_never_uses_weaker_choice(self):
+    def test_no_forever_toggle_off_uses_no_weaker_choice(self):
         w = world([ts("running"), snap(appr("a1", options=OPTIONS[:1])), ts("completed")])
         code, res, err = self.run_wait(w, True)
         self.assertEqual(code, EXIT_HUMAN)
         self.assertEqual(w["decided"], [])
         self.assertIn("no forever option", err)
+
+    def test_no_forever_toggle_on_decides_allow_once(self):
+        w = world([ts("running"), snap(appr("a1", options=OPTIONS[:1])), ts("completed")],
+                  history=[reply(11, "Released v1.3.10.")])
+        code, res, err = self.run_wait(w, True, allow_once=True)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(res["outcome"], "done")
+        self.assertEqual(w["decided"], [("a1", ONCE)])
+        self.assertEqual(res["auto_approved"][0]["decision"], ONCE)
+        self.assertEqual(res["auto_approved"][0]["kind"], "network_access")
+        self.assertEqual(res["auto_approved"][0]["scope"], "uploads.github.com")
+        self.assertIn("auto-approved a1 (allow_once)", err)
+        self.assertNotIn("allow_always", err)
+
+    def test_no_forever_toggle_on_via_env(self):
+        w = world([ts("running"), snap(appr("a1", options=OPTIONS[:1])), ts("completed")],
+                  history=[reply(11, "Released v1.3.10.")])
+        with mock.patch.dict(os.environ, {"MUSE_AUTO_ALLOW_ONCE": "on"}):
+            code, res, _ = self.run_wait(w, True)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(w["decided"], [("a1", ONCE)])
+
+    def test_supplied_approver_ignores_bad_allow_once_env(self):
+        # A caller-supplied approver embodies its own policy: an invalid
+        # MUSE_AUTO_ALLOW_ONCE must not raise before the wait starts.
+        w = world([ts("running"), snap(appr("a1")), ts("completed")],
+                  history=[reply(11, "Released v1.3.10.")])
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"MUSE_AUTO_ALLOW_ONCE": "maybe"}), \
+                mock.patch.object(cli, "connect", lambda cfg: FakeGateway(w)), \
+                redirect_stderr(err):
+            code, res = cli.run_wait(
+                {}, after_seq=10, timeout=5, auto_approve=True,
+                approver=lambda items: [i["approval_id"] for i in items])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(res["outcome"], "done")
+
+    def test_toggle_on_still_prefers_forever(self):
+        w = world([ts("running"), snap(appr("a1")), ts("completed")],
+                  history=[reply(11, "Released v1.3.10.")])
+        code, res, err = self.run_wait(w, True, allow_once=True)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(w["decided"], [("a1", "allow_always")])
+        self.assertIn("auto-approved a1 (allow_always)", err)
+
+    def test_session_or_deny_only_never_decides_even_with_toggle_on(self):
+        for options in ([{"kind": "allow_session"}, {"kind": "deny"}],
+                        [{"kind": "deny"}]):
+            w = world([ts("running"), snap(appr("a1", options=options)), ts("completed")])
+            code, res, _ = self.run_wait(w, True, allow_once=True)
+            self.assertEqual(code, EXIT_HUMAN)
+            self.assertEqual(w["decided"], [])
+
+    def test_allow_once_applies_to_any_kind(self):
+        a = appr("a1", options=OPTIONS[:1])
+        a["display"]["permission_question"]["kind"] = "file_access"
+        w = world([ts("running"), snap(a), ts("completed")], history=[reply(11, "done")])
+        code, _, _ = self.run_wait(w, True, allow_once=True)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(w["decided"], [("a1", ONCE)])
+
+    def test_skip_warning_not_repeated_within_one_approver(self):
+        w = world([])
+        approved, errors = [], []
+        approver = cli.make_auto_approver({}, approved, errors,
+                                          connector=lambda cfg: FakeGateway(w), allow_once=False)
+        a = describe_approval(appr("a1", options=OPTIONS[:1]))
+        err1 = io.StringIO()
+        with redirect_stderr(err1):
+            self.assertEqual(approver([a]), [])
+        err2 = io.StringIO()
+        with redirect_stderr(err2):
+            self.assertEqual(approver([a]), [])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(err1.getvalue().count("SKIPPED"), 1)
+        self.assertEqual(err2.getvalue().count("SKIPPED"), 0)
+        self.assertIn("network_access", err1.getvalue())
+        self.assertIn("uploads.github.com", err1.getvalue())
 
 
 class ApproveAllTest(unittest.TestCase):

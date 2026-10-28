@@ -78,6 +78,7 @@ def describe_approval(a):
 
 
 FOREVER = "allow_always"  # Muse's "forever" / "Always allow" choice
+ONCE = "allow_once"     # Muse's "Allow once" choice
 
 
 def offers_forever(described):
@@ -85,6 +86,32 @@ def offers_forever(described):
     Approvals that list no options (older servers) are assumed to accept it."""
     opts = described.get("options")
     return not opts or FOREVER in opts
+
+
+def offers_once(described):
+    """True only when allow_once is explicitly listed in the options."""
+    opts = described.get("options")
+    return bool(opts) and ONCE in opts
+
+
+def choose_auto_decision(described, auto_approve, allow_once=False):
+    """The decision an auto-approver may send, or None to leave it for a human.
+
+    allow_always wins when offered. Otherwise allow_once, and only when the
+    caller explicitly enabled the fallback (allow_once=True) and auto-approve
+    is on. Never picks options[0], never allow_session/allow_today, and
+    never restricts by kind: the caller decides the policy, this helper
+    only reads the offered options. An approval listing no options keeps
+    the offers_forever assumption (allow_always), it is not turned into
+    allow_once.
+    """
+    if not auto_approve:
+        return None
+    if offers_forever(described):
+        return FOREVER
+    if allow_once and offers_once(described):
+        return ONCE
+    return None
 
 
 def open_widgets(ev):

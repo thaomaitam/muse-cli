@@ -55,25 +55,50 @@ three choices: Allow once (`allow_once`), Always allow this site
 sends `allow_always`.
 
 Auto-approve makes `wait` and `send --wait/--until-done` decide every pending
-approval with `allow_always` (never once/session/today) and keep waiting for
-the turn instead of exiting 4. Each one is logged on stderr
-(`auto-approved ID (allow_always): ...`) and listed in the JSON result as
-`auto_approved` (`approval_id`, `title`, `kind`, `scope`, `decision`).
-Questions (`needs_input`) still exit 4: they can't be auto-answered. An
-approval without a forever option, or a failed decide, is reported in
-`auto_approve_errors` and still exits 4 with `needs_approval`.
+approval with `allow_always` and keep waiting for the turn instead of
+exiting 4. When the separate `auto_allow_once` fallback toggle is on (and
+auto-approve is on), an approval that offers no forever option is decided
+with `allow_once` instead of being left for a human; the fallback applies
+to every kind, never picks `options[0]`, and never uses session/today.
+Each decision is logged on stderr with its real decision
+(`auto-approved ID (allow_always|allow_once): ... [kind scope]`) and listed
+in the JSON result as `auto_approved` (`approval_id`, `title`, `kind`,
+`scope`, `decision`). The shared helper is `choose_auto_decision` in
+`wait.py`, used by both `make_auto_approver` (`cli.py`) and
+`Bot.approve_forever` (`tgbot.py`). Questions (`needs_input`) still exit
+4: they can't be auto-answered. An approval with neither option, or a
+failed decide, is reported in `auto_approve_errors` and still exits 4 with
+`needs_approval`. An approval that offers no forever option is warned
+about at most once per id (a `warned` set that gates only the warning);
+the warning names its title, kind, scope and offered options. If the
+monitor and a turn present the same approval at once, the second caller
+waits up to 15 seconds for the in-flight claim to resolve instead of
+ending the turn as `needs_approval`; if the claim fails or times out,
+the second caller decides it itself.
 
 ```bash
-muse-cli auto-approve status   # {"auto_approve": "always"|"off", "source": ...}
+muse-cli auto-approve status   # {"auto_approve": "always"|"off", "auto_allow_once": true|false, ...}
 muse-cli auto-approve on       # persistent, in the active profile's config.json
 muse-cli auto-approve off
+muse-cli auto-approve once on|off   # the allow_once fallback toggle (default off)
 MUSE_AUTO_APPROVE=always|off   # env override for one shell/process
+MUSE_AUTO_ALLOW_ONCE=on|off    # env override for the fallback, one shell/process
 muse-cli wait ... --auto-approve | --no-auto-approve   # per call (send too)
+muse-cli wait ... --auto-allow-once | --no-auto-allow-once   # per call (send too)
 muse-cli approve --all --always   # approve everything pending now, forever
 muse-cli approvals --approve-all  # same
 ```
 
-Precedence: flag, then `MUSE_AUTO_APPROVE`, then the config. Default is off.
+Precedence (each toggle separately): flag, then its env var, then the
+config. Auto-approve defaults to off; the fallback defaults to off. The
+Telegram bot defaults auto-approve to on and the fallback to off;
+`/autoapprove once on|off|status` toggles the fallback, stored in
+`telegram-state.json` and mirrored to the profile's `config.json`, and
+takes effect in the running bot. By contrast `muse-cli auto-approve once
+on|off` writes only `config.json`: the bot reads `telegram-state.json`
+once at startup and never reloads it, so a running bot needs a restart
+to pick the CLI change up. `muse-cli telegram status` reports the
+bot's stored `auto_allow_once` value.
 
 ## Cutting a release
 

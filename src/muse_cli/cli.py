@@ -206,18 +206,54 @@ def auto_approve_setting(cfg, flag=None):
     return str(cfg.get("auto_approve") or "off").lower() == "always", f"config {CONFIG_FILE}"
 
 
+AUTO_ALLOW_ONCE_ON = {"on", "1", "true", "yes", "always"}
+AUTO_ALLOW_ONCE_OFF = {"off", "0", "false", "no", "never", ""}
+
+
+def auto_allow_once_setting(cfg, flag=None):
+    """(enabled, source). Precedence: per-call flag, MUSE_AUTO_ALLOW_ONCE, config.
+
+    Enabled means: when auto-approve is on, an approval that offers no
+    forever option is decided with allow_once instead of being left for a
+    human. Default is off. The config value is a bool (or an on/off word);
+    the env var follows the same on/off words as MUSE_AUTO_APPROVE.
+    """
+    if flag is not None:
+        return bool(flag), "flag"
+    env = os.environ.get("MUSE_AUTO_ALLOW_ONCE")
+    if env is not None:
+        v = env.strip().lower()
+        if v in AUTO_ALLOW_ONCE_ON:
+            return True, "env MUSE_AUTO_ALLOW_ONCE"
+        if v in AUTO_ALLOW_ONCE_OFF:
+            return False, "env MUSE_AUTO_ALLOW_ONCE"
+        raise ValueError(f"MUSE_AUTO_ALLOW_ONCE must be on or off, not {env!r}")
+    v = cfg.get("auto_allow_once", False)
+    if isinstance(v, bool):
+        return v, f"config {CONFIG_FILE}"
+    return str(v).strip().lower() in AUTO_ALLOW_ONCE_ON, f"config {CONFIG_FILE}"
+
+
 def cmd_auto_approve(args):
     cfg = load_config()
+    once_state = getattr(args, "once_state", None)
     if args.state in ("on", "always"):
         cfg["auto_approve"] = "always"
         save_config(cfg)
     elif args.state == "off":
         cfg["auto_approve"] = "off"
         save_config(cfg)
+    elif args.state == "once" and once_state in ("on", "off"):
+        cfg["auto_allow_once"] = once_state == "on"
+        save_config(cfg)
     enabled, source = auto_approve_setting(cfg)
+    once_enabled, once_source = auto_allow_once_setting(cfg)
     out({"auto_approve": "always" if enabled else "off", "source": source,
          "config": cfg.get("auto_approve") or "off",
-         "env": os.environ.get("MUSE_AUTO_APPROVE")})
+         "env": os.environ.get("MUSE_AUTO_APPROVE"),
+         "auto_allow_once": once_enabled, "once_source": once_source,
+         "once_config": cfg.get("auto_allow_once", False),
+         "once_env": os.environ.get("MUSE_AUTO_ALLOW_ONCE")})
 
 
 def connect(cfg):
@@ -1000,7 +1036,8 @@ def _send_finish(args, cfg, scope, user_seq, stream_sid, gw=None):
     # connect + Noise handshake per subscription or history read.
     conn = (lambda _cfg: gw.lease()) if gw is not None and hasattr(gw, "lease") else None
     code, res = run_wait(cfg, args.thread, user_seq, wait_s, require_running=True,
-                         auto_approve=args.auto_approve, connector=conn)
+                         auto_approve=args.auto_approve, connector=conn,
+                         auto_allow_once=getattr(args, "auto_allow_once", None))
     result.update(outcome=res["outcome"], status=res["status"], final_text=res["final_text"],
                   replies=res["replies"])
     for k in ("approvals", "auto_approved", "auto_approve_errors", "widgets", "question",
@@ -1042,11 +1079,16 @@ def decide_approval(gw, approval_id, decision):
                         body={"decision": decision})
 
 
-def make_auto_approver(cfg, approved, errors, connector=None):
+def make_auto_approver(cfg, approved, errors, connector=None, allow_once=False):
     """Approver for Waiter: allow_always each new approval on its own connection
-    (the subscription's reader owns the other one). Logs to stderr, records
-    successes in `approved` and failures in `errors`; returns handled ids."""
-    from .wait import FOREVER, offers_forever
+    (the subscription's reader owns the other one). When allow_once is on,
+    an approval with no forever option is decided with allow_once instead
+    of being left for a human. Logs to stderr, records successes in
+    `approved` and failures in `errors`; returns handled ids. A skipped
+    approval is warned about once per approver, but stays undecided."""
+    from .wait import choose_auto_decision
+
+    warned = set()
 
     def approve(items):
         done = []
@@ -1059,23 +1101,27 @@ def make_auto_approver(cfg, approved, errors, connector=None):
         try:
             for a in items:
                 aid = a["approval_id"]
+                decision = choose_auto_decision(a, True, allow_once)
                 row = {"approval_id": aid, "title": a.get("title"), "kind": a.get("kind"),
-                       "scope": a.get("scope"), "decision": FOREVER}
-                if not offers_forever(a):
-                    # Never fall back to once/session/today: leave it for a human.
-                    errors.append({**row, "error": f"no forever option (offers {a.get('options')})"})
-                    print(f"auto-approve SKIPPED {aid}: Muse offers no forever option "
-                          f"{a.get('options')}", file=sys.stderr, flush=True)
+                       "scope": a.get("scope"), "decision": decision}
+                if decision is None:
+                    if aid not in warned:
+                        warned.add(aid)
+                        errors.append({**row, "decision": None,
+                                       "error": f"no forever option (offers {a.get('options')})"})
+                        print(f"auto-approve SKIPPED {aid}: Muse offers no forever option "
+                              f"{a.get('options')} [{a.get('kind')} {a.get('scope')}] "
+                              f"{a.get('title')}", file=sys.stderr, flush=True)
                     continue
                 try:
-                    decide_approval(gw, aid, FOREVER)
+                    decide_approval(gw, aid, decision)
                 except (GatewayError, TimeoutError) as e:
                     errors.append({**row, "error": str(e)})
                     print(f"auto-approve FAILED {aid}: {e}", file=sys.stderr, flush=True)
                     continue
                 approved.append(row)
                 done.append(aid)
-                print(f"auto-approved {aid} (allow_always): {row['title']} "
+                print(f"auto-approved {aid} ({decision}): {row['title']} "
                       f"[{row['kind']} {row['scope']}]", file=sys.stderr, flush=True)
         finally:
             gw.close()
@@ -1114,12 +1160,18 @@ RESUB_PAUSE = 1.0       # pause before re-subscribing after a stream ended
 
 def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=False,
              on_event=None, auto_approve=None, connector=None, approver=None,
-             should_stop=None, recheck=None, recheck_after=None, log=None):
+             should_stop=None, recheck=None, recheck_after=None, log=None,
+             auto_allow_once=None):
     """Subscribe until the turn ends, a human is needed, or timeout.
 
     auto_approve: True/False per call, None to use MUSE_AUTO_APPROVE or the
     config (`muse-cli auto-approve`). When on, pending approvals are approved
     with allow_always and the wait goes on; questions still end it.
+    auto_allow_once: True/False per call, None to use MUSE_AUTO_ALLOW_ONCE
+    or the config (only when the built-in approver is used). When on (and
+    auto-approve is on), an approval with no forever option is approved
+    with allow_once instead of exiting 4. A caller-supplied approver is
+    not affected by this value or by the env var.
     connector: callable(cfg) -> gateway (default `connect`). approver: replaces
     the built-in auto-approver when auto-approve is on. should_stop: callable
     polled every couple of seconds; True ends the wait early (outcome timeout).
@@ -1143,11 +1195,25 @@ def run_wait(cfg, thread=None, after_seq=None, timeout=600, require_running=Fals
     log = log or logging.getLogger("muse_cli.wait")
     scope = {"session_id": thread} if thread else {}
     enabled, _src = auto_approve_setting(cfg, auto_approve)
+    # An explicitly supplied allow_once value is used as-is, without
+    # evaluating MUSE_AUTO_ALLOW_ONCE (a bot turn supplies its resolved
+    # state toggle here; a bad env value must not kill the turn). The env
+    # is evaluated only when the built-in approver will actually be used
+    # and no explicit value was supplied. A caller-supplied approver
+    # embodies its own allow_once policy, so the env is not evaluated
+    # for it either.
+    if auto_allow_once is not None:
+        once_enabled = bool(auto_allow_once)
+    elif approver is None:
+        once_enabled, _once_src = auto_allow_once_setting(cfg, auto_allow_once)
+    else:
+        once_enabled = False
     approved, approve_errors = [], []
     conn = connector or connect
     recheck_after = RECHECK_AFTER if recheck_after is None else recheck_after
     if enabled:
-        approver = approver or make_auto_approver(cfg, approved, approve_errors, connector=conn)
+        approver = approver or make_auto_approver(cfg, approved, approve_errors, connector=conn,
+                                                  allow_once=once_enabled)
     else:
         approver = None
 
@@ -1309,7 +1375,8 @@ def _print_wait(res, as_json):
 
 def cmd_wait(args):
     code, res = run_wait(load_config(), args.thread, args.after_seq, args.timeout,
-                         require_running=args.require_running, auto_approve=args.auto_approve)
+                         require_running=args.require_running, auto_approve=args.auto_approve,
+                         auto_allow_once=getattr(args, "auto_allow_once", None))
     _print_wait(res, args.json)
     sys.exit(code)
 
@@ -1385,6 +1452,15 @@ def _auto_approve_flags(p):
                    help="approve pending approvals with allow_always and keep waiting")
     g.add_argument("--no-auto-approve", dest="auto_approve", action="store_false",
                    help="stop with exit 4 on approvals even if auto-approve is on")
+
+
+def _auto_allow_once_flags(p):
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--auto-allow-once", dest="auto_allow_once", action="store_true", default=None,
+                   help="when auto-approve is on, approve approvals with no forever "
+                        "option with allow_once and keep waiting")
+    g.add_argument("--no-auto-allow-once", dest="auto_allow_once", action="store_false",
+                   help="leave approvals with no forever option for a human (exit 4)")
 
 
 def _print_watch_row(line, show_all):
@@ -1880,6 +1956,7 @@ def main(argv=None):
     p.add_argument("--download", metavar="DIR", default=None,
                    help="save files the reply produced into DIR (needs --wait)")
     _auto_approve_flags(p)
+    _auto_allow_once_flags(p)
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser("wait", help="block until the agent's turn ends (0 ok, 2 failed, 4 needs human, 124 timeout)")
     p.add_argument("--thread", default=None); p.add_argument("--after-seq", type=int, default=None)
@@ -1887,6 +1964,7 @@ def main(argv=None):
     p.add_argument("--require-running", action="store_true",
                    help="ignore an already-finished status until a new run starts")
     _auto_approve_flags(p)
+    _auto_allow_once_flags(p)
     p.set_defaults(fn=cmd_wait)
     p = sub.add_parser("approvals", help="list pending approvals (network access etc.)")
     p.add_argument("--recent", action="store_true"); p.add_argument("--raw", action="store_true")
@@ -1901,8 +1979,11 @@ def main(argv=None):
         g.add_argument(f"--{k}", action="store_true", help=f"allow_{k}")
     p.set_defaults(fn=cmd_decide(_approve_decision))
     p = sub.add_parser("auto-approve",
-                       help="let wait/send approve every approval with allow_always (on|off|status)")
-    p.add_argument("state", nargs="?", default="status", choices=["on", "always", "off", "status"])
+                       help="let wait/send approve every approval with allow_always (on|off|status); "
+                            "once on|off controls the allow_once fallback")
+    p.add_argument("state", nargs="?", default="status",
+                   choices=["on", "always", "off", "status", "once"])
+    p.add_argument("once_state", nargs="?", default=None, choices=["on", "off", "status"])
     p.set_defaults(fn=cmd_auto_approve)
     p = sub.add_parser("deny", help="deny a pending request"); p.add_argument("id")
     p.add_argument("--always", action="store_true", help="deny_always")

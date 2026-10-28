@@ -172,6 +172,7 @@ muse-cli wait --after-seq N [--thread ID]         # block until the turn ends (n
 muse-cli approvals ; muse-cli approve ID --always ; muse-cli deny ID
 muse-cli approve --all --always                   # approve everything pending, forever
 muse-cli auto-approve on|off|status               # wait/send approve approvals forever and keep going
+muse-cli auto-approve once on|off|status          # fallback: no-forever approvals get allow_once (default off)
 muse-cli --profile work status                    # another login; see Profiles below
 muse-cli watch --timeout 60                       # tail live agent events
 muse-cli usage                                    # plan: weekly limit % used, reset, bonus tokens
@@ -225,7 +226,7 @@ Pipe it into other tools:
 muse-cli send "what's on my calendar today?" | jq -r .reply.text
 ```
 
-Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer (incl. a plain-text question in the final reply; with `muse-cli auto-approve on`, `MUSE_AUTO_APPROVE=always` or `--auto-approve`, approvals are decided with `allow_always`, Muse's "Always allow" choice, listed in `auto_approved`, and the wait goes on), 124 timeout; always read `final_text`; `send` exits 5 if delivery is not acked.
+Agents: never poll `history` in a sleep loop; use `send --until-done` or a background `wait`. Exit codes: 0 done, 2 failed, 4 needs approval/answer (incl. a plain-text question in the final reply; with `muse-cli auto-approve on`, `MUSE_AUTO_APPROVE=always` or `--auto-approve`, approvals are decided with `allow_always`, Muse's "Always allow" choice, listed in `auto_approved`, and the wait goes on; when the separate fallback toggle is on (`muse-cli auto-approve once on`, `MUSE_AUTO_ALLOW_ONCE=on` or `--auto-allow-once`, default off), an approval that offers no forever option is decided with `allow_once` instead, for every kind, and the real decision is recorded in `auto_approved`), 124 timeout; always read `final_text`; `send` exits 5 if delivery is not acked.
 
 ## Profiles
 
@@ -322,6 +323,7 @@ hop is about 0.1 s.
 | `/rename <title>`, `/pin`, `/unpin`, `/archive`, `/unarchive`, `/delete` | manage the current side chat (`/delete` asks first) |
 | `/approvals` | pending approvals with Always allow / Deny buttons |
 | `/autoapprove on\|off\|status` | default **on**: every approval gets Muse's forever choice (`allow_always`) so Muse never blocks |
+| `/autoapprove once on\|off\|status` | default **off**: approvals with no forever option fall back to `allow_once` when auto-approve is on; the CLI `auto-approve once` command writes only `config.json`, so a running bot needs a restart to pick it up |
 | `/watch on\|off` | forward live tool/progress events (batched) |
 | `/files` | recent files Muse made; tap to download |
 | `/fs ls\|tree\|cat\|get\|find\|stat\|mkdir\|mv\|rm …` | System Files (`rm` asks first; long `cat` comes as a file) |

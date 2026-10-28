@@ -1,8 +1,9 @@
 import json
 import unittest
 
-from muse_cli.wait import (EXIT_FAILED, EXIT_HUMAN, EXIT_OK, EXIT_TIMEOUT, Waiter,
-                           clean_text, describe_approval, exit_code, replies_after, user_ack)
+from muse_cli.wait import (EXIT_FAILED, EXIT_HUMAN, EXIT_OK, EXIT_TIMEOUT, ONCE, Waiter,
+                           choose_auto_decision, clean_text, describe_approval, exit_code,
+                           offers_once, replies_after, user_ack)
 
 ROOT = "20acb600"
 
@@ -21,6 +22,45 @@ APPROVAL = {"approval_id": "a1", "request_expires_at_ms": 5,
                                                 "text": "Allow {assistant} to share information with github.com?"},
                         "detail_rows": [{"label": "Host", "value": "github.com"}]},
             "payload": {"type": "network"}}
+
+
+class ChooseAutoDecisionTest(unittest.TestCase):
+    def described(self, options, kind="network_access"):
+        a = {"approval_id": "a1",
+             "display": {"summary_title": "Share info",
+                         "permission_question": {"kind": kind, "scope": "example.com"}},
+             "decision_options": None if options is None else [{"kind": o} for o in options]}
+        return describe_approval(a)
+
+    def test_forever_preferred_when_offered(self):
+        d = self.described(["allow_once", "allow_always", "deny"])
+        self.assertEqual(choose_auto_decision(d, True, True), "allow_always")
+        self.assertEqual(choose_auto_decision(d, True, False), "allow_always")
+        self.assertTrue(offers_once(d))
+
+    def test_once_fallback_only_when_toggle_on(self):
+        d = self.described(["allow_once", "deny"])
+        self.assertEqual(choose_auto_decision(d, True, True), ONCE)
+        self.assertIsNone(choose_auto_decision(d, True, False))
+        self.assertIsNone(choose_auto_decision(d, False, True))
+
+    def test_no_kind_restriction(self):
+        d = self.described(["allow_once", "deny"], kind="file_access")
+        self.assertEqual(choose_auto_decision(d, True, True), ONCE)
+
+    def test_deny_only_and_session_only_never_decide(self):
+        self.assertIsNone(choose_auto_decision(self.described(["deny"]), True, True))
+        self.assertIsNone(choose_auto_decision(self.described(["allow_session", "deny"]), True, True))
+        self.assertIsNone(choose_auto_decision(self.described(["allow_today", "deny"]), True, True))
+
+    def test_no_options_keeps_forever_assumption(self):
+        d = self.described(None)
+        self.assertEqual(choose_auto_decision(d, True, True), "allow_always")
+        self.assertEqual(choose_auto_decision(d, True, False), "allow_always")
+        self.assertFalse(offers_once(d))
+
+    def test_empty_options_keeps_forever_assumption(self):
+        self.assertEqual(choose_auto_decision(self.described([]), True, True), "allow_always")
 
 
 class WaiterTest(unittest.TestCase):

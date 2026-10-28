@@ -38,7 +38,8 @@ from . import cli
 from .gateway import AuthError, GatewayError
 from .tgapi import (CHUNK, UPLOAD_LIMIT, TelegramAPI, TelegramError, button, doc_name, esc,
                     file_kind, keyboard, md_to_html, needs_document, split_text)
-from .wait import FOREVER, describe_approval, event_name, offers_forever, pending_approvals
+from .wait import (FOREVER, choose_auto_decision, describe_approval, event_name,
+                   offers_forever, pending_approvals)
 
 log = logging.getLogger("muse_cli.telegram")
 
@@ -65,7 +66,7 @@ COMMANDS = [
     ("history", "last messages: /history [N]"),
     ("unread", "unread counts"),
     ("approvals", "pending approvals with buttons"),
-    ("autoapprove", "on | off | status (default on)"),
+    ("autoapprove", "on | off | status (default on) · once on | off | status"),
     ("watch", "on | off: forward live tool/progress events"),
     ("files", "recent files Muse made, as buttons"),
     ("fs", "System Files: ls tree cat get find stat mkdir mv rm"),
@@ -804,6 +805,41 @@ def media_label(r):
 
 
 # -- the bot ----------------------------------------------------------------------
+def _on_off_state(value, default=False):
+    """Parse a persisted on/off value like auto_allow_once_setting parses config.
+
+    A bool wins; a string is on only for the CLI's on-words ("on", "1",
+    "true", "yes", "always"). In particular the strings "false"/"off" are
+    off, unlike bool("false") which is True.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in cli.AUTO_ALLOW_ONCE_ON
+
+
+class _InFlightClaim:
+    """One in-progress approve_forever decision for one approval id.
+
+    `event` is set by the owning thread when it resolves the claim
+    (decided, failed, or no decision). `decision` is set only by the
+    owner, before the event, when it decided. `superseded` is set by a
+    waiter that timed out and took over: the superseded owner must not
+    record a decision, discard the new owner's claim, or return done.
+    A hung decide call that later completes server-side cannot be
+    unsent; the flag only stops the client double-recording it.
+    """
+
+    __slots__ = ("event", "decision", "failed", "superseded")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.decision = None
+        self.failed = False
+        self.superseded = False
+
+
 class Bot:
     def __init__(self, api, muse=None, home=None, sync=False, clock=time.time):
         self.api = api
@@ -827,8 +863,12 @@ class Bot:
         self.media_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tg-dl")  # concurrent downloads
         self.awaiting = {}         # chat_id -> "cookies"
         self.claimed = set()       # approval ids already being decided
+        self.decided_approvals = {}  # approval_id -> decision, decided in this process
+        self._inflight_claims = {}  # approval_id -> _InFlightClaim being decided
+        self.claim_wait_seconds = 15.0  # bound for waiting on another thread's claim
         self.notified = set()      # approval ids already announced
-        self.auto_log = []         # (time, approval_id, title) decided with allow_always
+        self.warned_no_forever = set()  # approval ids already warned about (warning only)
+        self.auto_log = []         # (time, approval_id, title, decision) auto-approved
         self.monitors = {}
         self.watch_buf = []
         self.watch_last = 0.0
@@ -838,6 +878,7 @@ class Bot:
         self.state.setdefault("chats", {})
         self.state.setdefault("watermarks", {})
         self.state.setdefault("auto_approve", True)   # the user's rule: never block Muse
+        self.state.setdefault("auto_allow_once", False)  # fallback toggle, default off
         self.state.setdefault("watch", False)
         self.state.setdefault("sent_media", [])
         prof = self.state.get("profile")
@@ -868,6 +909,10 @@ class Bot:
     @property
     def auto_approve(self):
         return bool(self.state.get("auto_approve", True))
+
+    @property
+    def auto_allow_once(self):
+        return _on_off_state(self.state.get("auto_allow_once", False), False)
 
     def save_state(self):
         with self.lock:
@@ -1463,7 +1508,8 @@ class Bot:
         _code, res = cli.run_wait(
             cfg, turn.session_id, after_seq, TURN_TIMEOUT, require_running=require_running,
             on_event=on_event, auto_approve=self.auto_approve, connector=self.muse.connect,
-            approver=self.approve_forever, should_stop=turn.should_stop,
+            approver=self.approve_forever, auto_allow_once=self.auto_allow_once,
+            should_stop=turn.should_stop,
             recheck=turn.take_recheck, recheck_after=WATCHDOG, log=log)
         turn.finish()
         turn.timing.mark("turn_end")
@@ -1478,9 +1524,12 @@ class Bot:
         outcome = res.get("outcome")
         text = "\n\n".join(r["text"] for r in res.get("replies") or [] if r.get("text")).strip()
         notes = []
-        for t, aid, title in list(self.auto_log):
+        for entry in list(self.auto_log):
+            t, aid, title = entry[0], entry[1], entry[2]
+            decision = entry[3] if len(entry) > 3 else FOREVER
+            label = "always" if decision == FOREVER else "once"
             if t >= turn.started:
-                notes.append(f"✅ auto-approved (always): {title or aid}")
+                notes.append(f"✅ auto-approved ({label}): {title or aid}")
         markup = None
         if outcome == "needs_input":
             opts = question_options(res)
@@ -1652,53 +1701,179 @@ class Bot:
             evs = self.turn_history(turn)
         self.set_watermark(turn.session_id, max((e.get("seq") or 0 for e in evs), default=None))
 
+    def _record_claim(self, claim, aid, decision, title):
+        """Record a successful decide for a claim owned by this call.
+
+        Returns True only if this call owned the claim when it resolved:
+        a superseded owner records nothing, discards nothing, and must
+        not return the id as done. The decision is recorded before the
+        claim's event is set, so a waiter that wakes on the event sees
+        the decision in decided_approvals/auto_log."""
+        with self.lock:
+            if claim.superseded:
+                claim.failed = True
+                claim.event.set()
+                return False
+            self.decided_approvals[aid] = decision
+            claim.decision = decision
+            self.auto_log = self.auto_log[-50:] + [(self.clock(), aid, title, decision)]
+            claim.event.set()
+            if self._inflight_claims.get(aid) is claim:
+                del self._inflight_claims[aid]
+            return True
+
+    def _fail_claim(self, claim, aid):
+        """Release a claim whose decide failed or produced no decision.
+
+        A superseded owner touches nothing shared: the takeover owner
+        owns the claim set and any decision it recorded. A failing
+        claim never recorded a decision, so this must never erase
+        decided_approvals: only _record_claim writes that dict, and a
+        decision recorded by a takeover must survive a later failure
+        path for the original claim (for example a second _fail_claim
+        during gateway teardown)."""
+        with self.lock:
+            if claim.superseded:
+                claim.failed = True
+                claim.event.set()
+                return False
+            claim.failed = True
+            claim.event.set()
+            if self._inflight_claims.get(aid) is claim:
+                del self._inflight_claims[aid]
+            self.claimed.discard(aid)
+            return True
+
+    def _await_claim(self, a, claim):
+        """Wait bounded for an in-flight claim; return (done, takeover).
+
+        If the owner decided, done is True and takeover is None. If the
+        owner failed, resolved without a decision, or did not resolve
+        within claim_wait_seconds, takeover is a fresh claim this caller
+        owns and must decide itself. If a different claim took over in
+        the meantime, wait on that one instead of overwriting it, so
+        three concurrent callers cannot each decide the same id."""
+        aid = a["approval_id"]
+        current = claim
+        while True:
+            settled = current.event.wait(self.claim_wait_seconds)
+            with self.lock:
+                if current.decision is not None:
+                    return True, None
+                nxt = self._inflight_claims.get(aid)
+                if nxt is not None and nxt is not current:
+                    current = nxt
+                    continue
+                if not settled:
+                    current.superseded = True
+                if self._inflight_claims.get(aid) is current:
+                    del self._inflight_claims[aid]
+                self.claimed.add(aid)
+                takeover = _InFlightClaim()
+                self._inflight_claims[aid] = takeover
+                return False, takeover
+
     # -- approvals ----------------------------------------------------------------
     def approve_forever(self, items):
-        """Approver for run_wait and the monitor: allow_always each approval
-        once (ids are claimed so two threads never decide the same one)."""
+        """Approver for run_wait and the monitor: decide each approval once
+        with the shared helper's decision (allow_always when offered, else
+        allow_once when the fallback toggle is on). Ids are claimed so two
+        threads never decide the same one; a failed decide discards the
+        claim so it can be retried. A second caller that finds an id
+        already being decided waits, bounded by claim_wait_seconds, for
+        that claim to resolve instead of ending its turn as
+        needs_approval: if the first thread decided, the second caller
+        returns done with the real decision; if it failed or timed out,
+        the second caller decides itself. An id claimed without an
+        in-flight registry entry (only ever set up directly in tests)
+        is still neither returned as done nor re-decided here. The
+        no-forever warning fires at most once per id and never blocks a
+        later decision."""
         done, todo = [], []
+        waited = []
         with self.lock:
             for a in items:
-                if a["approval_id"] in self.claimed:
-                    done.append(a["approval_id"])
+                aid = a["approval_id"]
+                if aid in self.decided_approvals:
+                    done.append(aid)
+                elif aid in self._inflight_claims:
+                    waited.append((a, self._inflight_claims[aid]))
+                elif aid in self.claimed:
+                    pass  # claimed without a registry entry: undecided, not done
                 else:
-                    self.claimed.add(a["approval_id"])
-                    todo.append(a)
+                    claim = _InFlightClaim()
+                    self._inflight_claims[aid] = claim
+                    self.claimed.add(aid)
+                    todo.append((a, claim))
+        for a, claim in waited:
+            is_done, takeover = self._await_claim(a, claim)
+            if is_done:
+                done.append(a["approval_id"])
+            else:
+                todo.append((a, takeover))
         if not todo:
             return done
-        with self.muse.gw() as g:
-            for a in todo:
-                aid = a["approval_id"]
-                if not offers_forever(a):
-                    log.warning("approval %s offers no forever option %s", aid, a.get("options"))
-                    with self.lock:
-                        self.claimed.discard(aid)
-                    continue
-                try:
-                    cli.decide_approval(g, aid, FOREVER)
-                    done.append(aid)
-                    with self.lock:
-                        self.auto_log = self.auto_log[-50:] + [(self.clock(), aid, a.get("title"))]
-                    log.info("auto-approved %s (allow_always): %s", aid, a.get("title"))
-                except (GatewayError, TimeoutError) as e:
-                    log.warning("auto-approve %s failed: %s", aid, e)
-                    with self.lock:
-                        self.claimed.discard(aid)
+        try:
+            with self.muse.gw() as g:
+                for a, claim in todo:
+                    aid = a["approval_id"]
+                    try:
+                        decision = choose_auto_decision(a, self.auto_approve, self.auto_allow_once)
+                        if decision is None:
+                            with self.lock:
+                                warned = aid in self.warned_no_forever
+                                self.warned_no_forever.add(aid)
+                            self._fail_claim(claim, aid)
+                            if not warned:
+                                log.warning("approval %s offers no forever option %s "
+                                            "[%s %s] %s", aid, a.get("options"),
+                                            a.get("kind"), a.get("scope"), a.get("title"))
+                            continue
+                        cli.decide_approval(g, aid, decision)
+                    except Exception as e:  # noqa: BLE001 - any decide failure must release the claim
+                        log.warning("auto-approve %s failed: %s", aid, e)
+                        self._fail_claim(claim, aid)
+                        continue
+                    if self._record_claim(claim, aid, decision, a.get("title")):
+                        done.append(aid)
+                        log.info("auto-approved %s (%s): %s [%s %s]", aid, decision,
+                                 a.get("title"), a.get("kind"), a.get("scope"))
+        except Exception as e:  # noqa: BLE001 - gw acquisition/close failure: release undecided claims
+            log.warning("auto-approve gateway unavailable: %s", e)
+            for a, claim in todo:
+                if a["approval_id"] not in done:
+                    self._fail_claim(claim, a["approval_id"])
         return done
 
     def on_pending(self, pend):
         """Monitor saw pending approvals (from any turn, ours or not)."""
         described = [describe_approval(a) for a in pend]
         if self.auto_approve:
-            new = [d for d in described if d["approval_id"] not in self.claimed]
+            # Only ids already decided are skipped here: an in-flight id
+            # must reach approve_forever so this caller waits bounded on
+            # the shared claim registry and takes over if it fails or
+            # times out, exactly like the Waiter path. Filtering on
+            # `claimed` would skip it entirely.
+            new = [d for d in described if d["approval_id"] not in self.decided_approvals]
             if new:
                 done = self.approve_forever(new)
                 if any(not t.finished for t in list(self.turns.values())):
                     return   # the running turn lists them in its reply
-                for d in new:
-                    if d["approval_id"] in done:
-                        self.notify(f"✅ Auto-approved (always): {esc(d.get('title') or d['approval_id'])}",
-                                    silent=True)
+                decisions = dict(self.decided_approvals)
+                # Claim notification slots atomically: concurrent
+                # on_pending callers waiting on the same claim must
+                # notify a decided id once between them.
+                to_notify = []
+                with self.lock:
+                    for d in new:
+                        aid = d["approval_id"]
+                        if aid in done and aid not in self.notified:
+                            self.notified.add(aid)
+                            to_notify.append(d)
+                for d in to_notify:
+                    label = "always" if decisions.get(d["approval_id"], FOREVER) == FOREVER else "once"
+                    self.notify(f"✅ Auto-approved ({label}): {esc(d.get('title') or d['approval_id'])}",
+                                silent=True)
             return
         if any(not t.finished for t in list(self.turns.values())):
             return   # the running turn shows its own buttons when it stops
@@ -1852,7 +2027,8 @@ class Bot:
                  f"Now: {now}",
                  f"Muse task here (server): <code>{esc(server)}</code>",
                  f"Profile: <code>{esc(self.profile)}</code> · auto-approve: "
-                 f"{'on (always)' if self.auto_approve else 'off'} · watch: "
+                 f"{'on (always)' if self.auto_approve else 'off'} · allow-once fallback: "
+                 f"{'on' if self.auto_allow_once else 'off'} · watch: "
                  f"{'on' if self.state.get('watch') else 'off'}",
                  f"muse-cli {esc(__version__)}"]
         if ident.get("tagline") or ident.get("vibe"):
@@ -2004,6 +2180,30 @@ class Bot:
 
     def cmd_autoapprove(self, chat_id, arg, **_):
         a = arg.strip().lower()
+        parts = a.split()
+        if parts and parts[0] == "once":
+            if len(parts) > 2:
+                return self.send(chat_id, "Usage: /autoapprove once on|off|status")
+            if len(parts) == 1 or parts[1] == "status":
+                pass
+            elif parts[1] in ("on", "off"):
+                on = parts[1] == "on"
+                with self.lock:
+                    self.state["auto_allow_once"] = on
+                    self.save_state()
+                cfg = cli.load_config()  # keep the CLI's setting for this profile in line
+                cfg["auto_allow_once"] = on
+                cli.save_config(cfg)
+                self.muse.reload()
+            else:
+                return self.send(chat_id, "Usage: /autoapprove once on|off|status")
+            self.send(chat_id, "Auto-allow-once is <b>" + ("on" if self.auto_allow_once else "off") +
+                               "</b>: approvals with no forever option " +
+                               ("are decided with allow_once when auto-approve is on."
+                                if self.auto_allow_once else
+                                "are left for a human (exit 4 / needs_approval).") +
+                               " Auto-approve is <b>" + ("on" if self.auto_approve else "off") + "</b>.")
+            return
         if a in ("on", "always", "off"):
             on = a != "off"
             with self.lock:
@@ -2017,7 +2217,9 @@ class Bot:
             return self.send(chat_id, "Usage: /autoapprove on|off|status")
         if self.auto_approve:
             self.send(chat_id, "✅ Auto-approve is <b>on</b>: every approval gets Muse's forever "
-                               "choice (allow_always), so Muse never blocks.")
+                               "choice (allow_always), so Muse never blocks." +
+                               (" Approvals with no forever option fall back to allow_once."
+                                if self.auto_allow_once else ""))
         else:
             self.send(chat_id, "Auto-approve is <b>off</b>: approvals come here with buttons.")
 
@@ -2727,6 +2929,7 @@ def cmd_tg_status(args):
         info["config_mode"] = oct(os.stat(path).st_mode & 0o777)
     info.update(owner_id=conf.get("owner_id"), allowed_user_ids=conf.get("allowed_user_ids"),
                 bot=conf.get("bot_username"), auto_approve=st.get("auto_approve", True),
+                auto_allow_once=_on_off_state(st.get("auto_allow_once", False), False),
                 watch=st.get("watch", False), muse_profile=st.get("profile") or cli.PROFILE,
                 chats=(st.get("chats") or {}).get(st.get("profile") or cli.PROFILE))
     if conf.get("token") and not args.offline:

@@ -534,6 +534,486 @@ def test_background_approvals(env):
     assert "✅ Always allow" in env.tg.buttons()
 
 
+NO_FOREVER = dict(APPROVAL, approval_id="a9",
+                  decision_options=[{"kind": "allow_once"}, {"kind": "deny"}])
+
+
+def test_autoapprove_once_command(env):
+    assert env.bot.auto_allow_once is False
+    env.bot.handle_update(msg("/autoapprove once on"))
+    assert env.bot.auto_allow_once is True
+    assert json.load(open(tgbot.state_path()))["auto_allow_once"] is True
+    assert json.load(open(cli.CONFIG_FILE))["auto_allow_once"] is True
+    env.bot.handle_update(msg("/autoapprove once status"))
+    assert "allow-once" in env.tg.sent()[-1]["text"].lower()
+    env.bot.handle_update(msg("/autoapprove once off"))
+    assert env.bot.auto_allow_once is False
+    assert json.load(open(tgbot.state_path()))["auto_allow_once"] is False
+
+
+def test_monitor_decides_allow_once_only_when_toggle_on(env, caplog):
+    import logging
+    env.bot.on_pending([NO_FOREVER])
+    assert env.s.decided == []
+    env.bot.on_pending([NO_FOREVER])
+    assert env.s.decided == []
+    with caplog.at_level(logging.WARNING, logger="muse_cli.telegram"):
+        env.bot.state["auto_allow_once"] = True
+        env.bot.on_pending([NO_FOREVER])
+    assert env.s.decided == [("a9", "allow_once")]
+
+
+def test_warning_deduped_but_approval_still_reaches_human(env, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="muse_cli.telegram"):
+        env.bot.approve_forever([{"approval_id": "a9", "title": "Share info with example.com",
+                                  "kind": "network_access", "scope": "example.com",
+                                  "options": ["allow_once", "deny"]}])
+        env.bot.approve_forever([{"approval_id": "a9", "title": "Share info with example.com",
+                                  "kind": "network_access", "scope": "example.com",
+                                  "options": ["allow_once", "deny"]}])
+    warnings = [r for r in caplog.records
+                if "offers no forever option" in r.getMessage() and "a9" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "example.com" in warnings[0].getMessage()
+    assert "network_access" in warnings[0].getMessage()
+    # A warned id is still decided once the toggle is turned on.
+    env.bot.state["auto_allow_once"] = True
+    assert env.bot.approve_forever([{"approval_id": "a9", "title": "Share info with example.com",
+                                     "kind": "network_access", "scope": "example.com",
+                                     "options": ["allow_once", "deny"]}]) == ["a9"]
+    assert env.s.decided == [("a9", "allow_once")]
+
+
+def test_turn_auto_approves_once_and_notes_it(env):
+    env.bot.state["auto_allow_once"] = True
+    env.s.approvals = [NO_FOREVER]
+
+    def script(sid):
+        return [ts("running"), snapshot(NO_FOREVER), lambda: env.s.add(sid, "message.assistant", "cloned"),
+                ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("clone the repo"))
+    assert env.s.decided == [("a9", "allow_once")]
+    final = env.tg.sent("editMessageText")[-1]["text"]
+    assert "cloned" in final and "auto-approved (once): Share info with github.com" in final
+    assert "auto-approved (always)" not in final
+
+
+def test_autoapprove_once_rejects_extra_tokens(env):
+    env.bot.handle_update(msg("/autoapprove once on xyz"))
+    assert env.bot.auto_allow_once is False
+    assert "Usage" in env.tg.sent()[-1]["text"]
+    env.bot.handle_update(msg("/autoapprove once status xyz"))
+    assert env.bot.auto_allow_once is False
+    assert "Usage" in env.tg.sent()[-1]["text"]
+
+
+def test_auto_allow_once_state_string_false(env):
+    for value, want in (("false", False), ("off", False), ("0", False), ("no", False),
+                        ("on", True), ("true", True), ("1", True), ("always", True),
+                        (True, True), (False, False)):
+        env.bot.state["auto_allow_once"] = value
+        assert env.bot.auto_allow_once is want
+
+
+def test_approve_forever_connection_error_retries(env, monkeypatch):
+    env.bot.state["auto_allow_once"] = True
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            raise ConnectionError("gateway down")
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    assert env.bot.approve_forever([item]) == []
+    assert env.s.decided == []
+    assert env.bot.approve_forever([item]) == ["a9"]
+    assert env.s.decided == [("a9", "allow_once")]
+    # Decided ids are reported done without a second decide.
+    assert env.bot.approve_forever([item]) == ["a9"]
+    assert len(env.s.decided) == 1
+
+
+def test_approve_forever_gateway_failure_releases_claim(env, monkeypatch):
+    def broken(cfg):
+        raise ConnectionError("gateway down")
+
+    monkeypatch.setattr(env.bot.muse, "connector", broken)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    assert env.bot.approve_forever([item]) == []
+    assert "a9" not in env.bot.claimed
+    monkeypatch.setattr(env.bot.muse, "connector", env.s.connect)
+    env.bot.state["auto_allow_once"] = True
+    assert env.bot.approve_forever([item]) == ["a9"]
+    assert env.s.decided == [("a9", "allow_once")]
+
+
+def test_claimed_but_undecided_is_not_done(env):
+    # Another thread claimed the id but has not decided it yet: the caller
+    # must not be told it was handled, and must not decide it again.
+    env.bot.claimed.add("a9")
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    assert env.bot.approve_forever([item]) == []
+    assert env.s.decided == []
+    env.bot.claimed.discard("a9")
+    env.bot.state["auto_allow_once"] = True
+    assert env.bot.approve_forever([item]) == ["a9"]
+    assert env.s.decided == [("a9", "allow_once")]
+
+
+def test_inflight_waiter_sees_done_without_double_decide(env, monkeypatch):
+    import threading
+    import time
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 5.0
+    started = threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            started.set()
+            # Block briefly so the second caller must wait on the claim;
+            # no external release: the waiting caller is the test thread.
+            time.sleep(0.3)
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    results = {}
+
+    def first():
+        results["first"] = env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    results["second"] = env.bot.approve_forever([item])
+    t.join(5)
+    assert not t.is_alive()
+    assert results["second"] == ["a9"]
+    assert results["first"] == ["a9"]
+    assert len(calls) == 1
+    assert env.s.decided == [("a9", "allow_once")]
+    assert env.bot._inflight_claims == {}
+
+
+def test_inflight_waiter_decides_after_first_failure(env, monkeypatch):
+    import threading
+    import time
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 5.0
+    started = threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            started.set()
+            time.sleep(0.3)
+            raise ConnectionError("gateway down")
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    results = {}
+
+    def first():
+        results["first"] = env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    results["second"] = env.bot.approve_forever([item])
+    t.join(5)
+    assert not t.is_alive()
+    assert results["first"] == []
+    assert results["second"] == ["a9"]
+    assert len(calls) == 2
+    assert env.s.decided == [("a9", "allow_once")]
+    assert env.bot._inflight_claims == {}
+
+
+def test_inflight_waiter_takes_over_after_timeout(env, monkeypatch):
+    import threading
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 0.05
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            # Hung transport that never sent: blocks, then returns without
+            # recording a decision once released.
+            started.set()
+            assert release.wait(5)
+            return
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    results = {}
+
+    def first():
+        results["first"] = env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    results["second"] = env.bot.approve_forever([item])
+    assert results["second"] == ["a9"]
+    assert env.s.decided == [("a9", "allow_once")]
+    release.set()
+    t.join(5)
+    assert not t.is_alive()
+    # The released first thread must not decide again or re-record.
+    assert results["first"] == []
+    assert len(calls) == 2
+    assert env.s.decided == [("a9", "allow_once")]
+    assert env.bot.approve_forever([item]) == ["a9"]
+    assert len(calls) == 2
+    assert env.bot._inflight_claims == {}
+
+
+def test_on_pending_labels_survive_auto_log_truncation(env):
+    env.bot.state["auto_allow_once"] = True
+    env.bot.auto_log = [(0.0, f"old{i}", "old", "allow_always") for i in range(60)]
+    items = [dict(NO_FOREVER, approval_id=f"a{i}") for i in range(55)]
+    env.bot.on_pending(items)
+    assert len(env.s.decided) == 55
+    labels = [t for t in env.tg.texts() if "Auto-approved" in (t or "")]
+    assert len(labels) == 55
+    assert all("(once)" in t for t in labels)
+    assert not any("(always)" in t for t in labels)
+
+
+def test_on_pending_waits_for_inflight_claim(env, monkeypatch):
+    import threading
+    import time
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 5.0
+    started = threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            started.set()
+            time.sleep(0.3)
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    results = {}
+
+    def first():
+        results["first"] = env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    env.bot.on_pending([NO_FOREVER])
+    t.join(5)
+    assert not t.is_alive()
+    assert results["first"] == ["a9"]
+    assert len(calls) == 1
+    assert env.s.decided == [("a9", "allow_once")]
+    labels = [x for x in env.tg.texts() if "Auto-approved" in (x or "")]
+    assert len(labels) == 1
+    assert "(once)" in labels[0]
+
+
+def test_on_pending_takes_over_after_inflight_failure(env, monkeypatch):
+    import threading
+    import time
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 5.0
+    started = threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            started.set()
+            time.sleep(0.3)
+            raise ConnectionError("gateway down")
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    results = {}
+
+    def first():
+        results["first"] = env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    env.bot.on_pending([NO_FOREVER])
+    t.join(5)
+    assert not t.is_alive()
+    assert results["first"] == []
+    assert len(calls) == 2
+    assert env.s.decided == [("a9", "allow_once")]
+    labels = [x for x in env.tg.texts() if "Auto-approved" in (x or "")]
+    assert len(labels) == 1
+    assert "(once)" in labels[0]
+
+
+def test_on_pending_concurrent_waiters_notify_once(env, monkeypatch):
+    import threading
+    import time
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 5.0
+    started = threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            started.set()
+            time.sleep(0.3)
+        env.s.decided.append((aid, decision))
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+
+    def first():
+        env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    monitors = [threading.Thread(target=lambda: env.bot.on_pending([NO_FOREVER])) for _ in range(2)]
+    for m in monitors:
+        m.start()
+    for m in monitors:
+        m.join(5)
+    t.join(5)
+    assert not t.is_alive()
+    assert all(not m.is_alive() for m in monitors)
+    assert len(calls) == 1
+    assert env.s.decided == [("a9", "allow_once")]
+    labels = [x for x in env.tg.texts() if "Auto-approved" in (x or "")]
+    assert len(labels) == 1
+
+
+def test_on_pending_inflight_failure_notifies_nothing(env, monkeypatch):
+    import threading
+    import time
+    env.bot.state["auto_allow_once"] = True
+    env.bot.claim_wait_seconds = 5.0
+    started = threading.Event()
+    calls = []
+
+    def fake_decide(gw, aid, decision):
+        calls.append((aid, decision))
+        if len(calls) == 1:
+            started.set()
+            time.sleep(0.3)
+        raise ConnectionError("gateway down")
+
+    monkeypatch.setattr(tgbot.cli, "decide_approval", fake_decide)
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    results = {}
+
+    def first():
+        results["first"] = env.bot.approve_forever([item])
+
+    t = threading.Thread(target=first)
+    t.start()
+    assert started.wait(5)
+    env.bot.on_pending([NO_FOREVER])
+    t.join(5)
+    assert not t.is_alive()
+    assert results["first"] == []
+    assert env.s.decided == []
+    assert "a9" not in env.bot.claimed
+    labels = [x for x in env.tg.texts() if "Auto-approved" in (x or "")]
+    assert labels == []
+
+
+def test_fail_claim_never_erases_takeover_decision(env):
+    # Direct unit test: reproducing the gw __exit__ double-_fail_claim
+    # interleaving with threads is fragile, but the invariant is exact —
+    # _fail_claim is only ever called for a claim that did not decide,
+    # so it must never erase a decision another claim recorded.
+    bot = env.bot
+    first = tgbot._InFlightClaim()
+    bot._inflight_claims["a9"] = first
+    bot.claimed.add("a9")
+    takeover = tgbot._InFlightClaim()
+    bot._inflight_claims["a9"] = takeover
+    assert bot._record_claim(takeover, "a9", "allow_once", "Share info with example.com") is True
+    assert bot.decided_approvals == {"a9": "allow_once"}
+    # The original claim's failure path runs after the takeover recorded
+    # (e.g. a second _fail_claim during gateway teardown). It is not
+    # superseded in this window, so the unconditional pop would erase it.
+    assert bot._fail_claim(first, "a9") is True
+    assert bot.decided_approvals == {"a9": "allow_once"}
+    item = {"approval_id": "a9", "title": "Share info with example.com",
+            "kind": "network_access", "scope": "example.com", "options": ["allow_once", "deny"]}
+    assert bot.approve_forever([item]) == ["a9"]
+    assert env.s.decided == []
+    # Superseded owners already touched nothing; keep that behaviour.
+    superseded = tgbot._InFlightClaim()
+    superseded.superseded = True
+    takeover2 = tgbot._InFlightClaim()
+    bot._inflight_claims["a10"] = takeover2
+    assert bot._record_claim(takeover2, "a10", "allow_always", "Share info with example.com") is True
+    assert bot._fail_claim(superseded, "a10") is False
+    assert bot.decided_approvals["a10"] == "allow_always"
+
+
+def test_turn_with_bad_allow_once_env_follows_state_off(env, monkeypatch):
+    monkeypatch.setenv("MUSE_AUTO_ALLOW_ONCE", "maybe")
+    env.s.approvals = [NO_FOREVER]
+    env.s.script = lambda sid: [ts("running"), snapshot(NO_FOREVER), ts("completed")]
+    env.bot.handle_update(msg("clone the repo"))
+    assert env.s.decided == []
+    assert "Approval" in env.tg.sent("editMessageText")[-1]["text"]
+
+
+def test_turn_with_bad_allow_once_env_follows_state_on(env, monkeypatch):
+    monkeypatch.setenv("MUSE_AUTO_ALLOW_ONCE", "maybe")
+    env.bot.state["auto_allow_once"] = True
+    env.s.approvals = [NO_FOREVER]
+
+    def script(sid):
+        return [ts("running"), snapshot(NO_FOREVER), lambda: env.s.add(sid, "message.assistant", "cloned"),
+                ts("completed")]
+    env.s.script = script
+    env.bot.handle_update(msg("clone the repo"))
+    assert env.s.decided == [("a9", "allow_once")]
+    final = env.tg.sent("editMessageText")[-1]["text"]
+    assert "auto-approved (once)" in final
+
+
+def test_tg_status_shows_allow_once_toggle(env, capsys):
+    import argparse
+    tgbot.write_private_json(tgbot.state_path(), {"auto_allow_once": "false"})
+    tgbot.cmd_tg_status(argparse.Namespace(offline=True))
+    assert json.loads(capsys.readouterr().out)["auto_allow_once"] is False
+    tgbot.write_private_json(tgbot.state_path(), {"auto_allow_once": "on"})
+    tgbot.cmd_tg_status(argparse.Namespace(offline=True))
+    assert json.loads(capsys.readouterr().out)["auto_allow_once"] is True
+
+
 # -- files in ------------------------------------------------------------------------------
 def test_photo_upload_goes_to_system_files_and_muse(env):
     env.tg.files["F1"] = b"\x89PNGdata"
